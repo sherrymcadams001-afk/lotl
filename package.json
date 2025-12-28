@@ -1,0 +1,24 @@
+{
+  "name": "lotl-agent",
+  "version": "1.0.0",
+  "description": "Living off the Land Controller - Connects to Chrome to automate AI chat interfaces",
+  "main": "lotl-controller.js",
+  "scripts": {
+    "start": "node lotl-controller.js",
+    "launch-chrome": "start chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\temp\\chrome-lotl"
+  },
+  "keywords": [
+    "puppeteer",
+    "automation",
+    "gemini",
+    "chatgpt",
+    "ai"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "body-parser": "^1.20.2",
+    "express": "^4.18.2",
+    "puppeteer-core": "^21.6.1"
+  }
+}

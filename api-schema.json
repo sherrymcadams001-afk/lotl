@@ -1,0 +1,171 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LotL Controller API Schema",
+  "description": "API specification for the Living-off-the-Land AI Controller. Routes prompts through a logged-in Google AI Studio session to bypass API quotas.",
+  "version": "2.0.0",
+  "baseUrl": "http://localhost:3000",
+  
+  "endpoints": {
+    "/chat": {
+      "method": "POST",
+      "description": "Send a prompt (with optional images) to AI Studio and get a response",
+      "requestBody": {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "description": "The text prompt to send to the AI model",
+            "maxLength": 1000000,
+            "examples": [
+              "What is 2 + 2?",
+              "Analyze this screenshot and describe what you see.",
+              "You are a helpful assistant. Respond in JSON format with keys: answer, confidence"
+            ]
+          },
+          "images": {
+            "type": "array",
+            "description": "Optional array of base64-encoded images (PNG/JPEG). Images are uploaded to AI Studio via Google Drive integration.",
+            "items": {
+              "type": "string",
+              "pattern": "^data:image/(png|jpeg|jpg|gif|webp);base64,[A-Za-z0-9+/=]+$",
+              "description": "Base64 data URL (e.g., 'data:image/png;base64,iVBORw0KGgo...')"
+            },
+            "maxItems": 10,
+            "examples": [
+              ["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="]
+            ]
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "description": "Successful response from AI Studio",
+          "content": {
+            "type": "object",
+            "properties": {
+              "success": {
+                "type": "boolean",
+                "const": true
+              },
+              "reply": {
+                "type": "string",
+                "description": "The AI model's response text"
+              }
+            },
+            "required": ["success", "reply"]
+          }
+        },
+        "400": {
+          "description": "Bad request - missing prompt",
+          "content": {
+            "type": "object",
+            "properties": {
+              "success": { "type": "boolean", "const": false },
+              "error": { "type": "string" }
+            }
+          }
+        },
+        "500": {
+          "description": "Server error - AI Studio unreachable or timeout",
+          "content": {
+            "type": "object",
+            "properties": {
+              "success": { "type": "boolean", "const": false },
+              "error": { "type": "string" }
+            }
+          }
+        }
+      },
+      "timeout": {
+        "recommended": 180000,
+        "description": "Timeout in milliseconds. Large prompts with images may take 60-180 seconds."
+      }
+    },
+    
+    "/health": {
+      "method": "GET",
+      "description": "Health check endpoint",
+      "responses": {
+        "200": {
+          "content": {
+            "type": "object",
+            "properties": {
+              "status": { "type": "string", "const": "ok" },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  },
+  
+  "imageHandling": {
+    "supportedFormats": ["image/png", "image/jpeg", "image/gif", "image/webp"],
+    "maxSizePerImage": "20MB",
+    "uploadMethod": "Google Drive integration (automatic)",
+    "compressionRecommendation": "For screenshots, consider resizing to max 1920x1080 before encoding to reduce upload time"
+  },
+  
+  "rateLimits": {
+    "description": "No API rate limits - uses logged-in session. However, respect AI Studio's fair use.",
+    "recommendedDelay": 1000,
+    "note": "Add 1 second delay between rapid-fire requests to avoid triggering anti-automation"
+  },
+  
+  "prerequisites": {
+    "chrome": {
+      "command": "chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\temp\\chrome-lotl",
+      "description": "Chrome must be running with remote debugging enabled"
+    },
+    "aiStudio": {
+      "url": "https://aistudio.google.com",
+      "requirement": "Must be logged in and have a chat session open"
+    },
+    "controller": {
+      "command": "node lotl-controller-v2.js",
+      "port": 3000
+    }
+  },
+  
+  "integrationExamples": {
+    "python": {
+      "simple": "import requests\nresponse = requests.post('http://localhost:3000/chat', json={'prompt': 'Hello'})\nprint(response.json()['reply'])",
+      "withImage": "import requests\nimport base64\n\nwith open('screenshot.png', 'rb') as f:\n    img_b64 = 'data:image/png;base64,' + base64.b64encode(f.read()).decode()\n\nresponse = requests.post('http://localhost:3000/chat', json={\n    'prompt': 'Describe this image',\n    'images': [img_b64]\n})\nprint(response.json()['reply'])"
+    },
+    "javascript": {
+      "simple": "const response = await fetch('http://localhost:3000/chat', {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({ prompt: 'Hello' })\n});\nconst data = await response.json();\nconsole.log(data.reply);"
+    },
+    "curl": {
+      "simple": "curl -X POST http://localhost:3000/chat -H 'Content-Type: application/json' -d '{\"prompt\": \"Hello\"}'",
+      "withTimeout": "curl -X POST http://localhost:3000/chat -H 'Content-Type: application/json' -d '{\"prompt\": \"Complex task\"}' --max-time 180"
+    }
+  },
+  
+  "errorHandling": {
+    "connectionRefused": {
+      "cause": "Controller not running or Chrome not connected",
+      "solution": "1. Start Chrome with debugging port\n2. Open AI Studio and log in\n3. Start controller: node lotl-controller-v2.js"
+    },
+    "timeout": {
+      "cause": "AI Studio taking too long or stuck",
+      "solution": "Increase timeout, check AI Studio tab manually, restart controller"
+    },
+    "emptyResponse": {
+      "cause": "AI Studio returned empty or parsing failed",
+      "solution": "Check AI Studio tab for errors, may need to start new chat session"
+    }
+  },
+  
+  "agentIntegration": {
+    "langchain": {
+      "wrapper": "Browser-use/lotl_llm.py",
+      "class": "ChatLotL",
+      "usage": "from lotl_llm import get_lotl_llm\nllm = get_lotl_llm()\nresult = llm.invoke('Hello')"
+    },
+    "browserUse": {
+      "example": "Browser-use/run_lotl_agent.py",
+      "notes": "Pass llm to Agent(), supports use_vision=True for screenshots"
+    }
+  }
+}
