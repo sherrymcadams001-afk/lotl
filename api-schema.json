@@ -6,9 +6,76 @@
   "baseUrl": "http://localhost:3000",
   
   "endpoints": {
+    "/ready": {
+      "method": "GET",
+      "description": "Readiness probe (Chrome debug port reachable, AI Studio tab present, input selector present)",
+      "responses": {
+        "200": {
+          "description": "Ready",
+          "content": {
+            "type": "object",
+            "properties": {
+              "ok": { "type": "boolean", "const": true }
+            }
+          }
+        },
+        "503": {
+          "description": "Not ready",
+          "content": {
+            "type": "object",
+            "properties": {
+              "ok": { "type": "boolean", "const": false },
+              "error": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+
+    "/aistudio": {
+      "method": "POST",
+      "description": "Send a prompt (with optional images) to AI Studio (Gemini) and get a response",
+      "requestBody": {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "description": "The text prompt to send to the AI model",
+            "maxLength": 1000000
+          },
+          "images": {
+            "type": "array",
+            "description": "Optional array of base64-encoded images (PNG/JPEG/GIF/WebP) as data URLs",
+            "items": {
+              "type": "string",
+              "pattern": "^data:image/(png|jpeg|jpg|gif|webp);base64,[A-Za-z0-9+/=]+$"
+            },
+            "maxItems": 10
+          }
+        }
+      },
+      "timeout": {
+        "recommended": 180000,
+        "description": "Timeout in milliseconds. Large prompts with images may take 60-180 seconds."
+      }
+    },
+
+    "/chatgpt": {
+      "method": "POST",
+      "description": "Send a prompt to ChatGPT and get a response (text-only)",
+      "requestBody": {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+          "prompt": { "type": "string" }
+        }
+      }
+    },
+
     "/chat": {
       "method": "POST",
-      "description": "Send a prompt (with optional images) to AI Studio and get a response",
+      "description": "Legacy unified endpoint (maps target=gemini->/aistudio, target=chatgpt->/chatgpt)",
       "requestBody": {
         "type": "object",
         "required": ["prompt"],
@@ -123,21 +190,21 @@
       "requirement": "Must be logged in and have a chat session open"
     },
     "controller": {
-      "command": "node lotl-controller-v2.js",
+      "command": "npm run start:local",
       "port": 3000
     }
   },
   
   "integrationExamples": {
     "python": {
-      "simple": "import requests\nresponse = requests.post('http://localhost:3000/chat', json={'prompt': 'Hello'})\nprint(response.json()['reply'])",
+      "simple": "import requests\nresponse = requests.post('http://localhost:3000/aistudio', json={'prompt': 'Hello'})\nprint(response.json()['reply'])",
       "withImage": "import requests\nimport base64\n\nwith open('screenshot.png', 'rb') as f:\n    img_b64 = 'data:image/png;base64,' + base64.b64encode(f.read()).decode()\n\nresponse = requests.post('http://localhost:3000/chat', json={\n    'prompt': 'Describe this image',\n    'images': [img_b64]\n})\nprint(response.json()['reply'])"
     },
     "javascript": {
-      "simple": "const response = await fetch('http://localhost:3000/chat', {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({ prompt: 'Hello' })\n});\nconst data = await response.json();\nconsole.log(data.reply);"
+      "simple": "const response = await fetch('http://localhost:3000/aistudio', {\n  method: 'POST',\n  headers: { 'Content-Type': 'application/json' },\n  body: JSON.stringify({ prompt: 'Hello' })\n});\nconst data = await response.json();\nconsole.log(data.reply);"
     },
     "curl": {
-      "simple": "curl -X POST http://localhost:3000/chat -H 'Content-Type: application/json' -d '{\"prompt\": \"Hello\"}'",
+      "simple": "curl -X POST http://localhost:3000/aistudio -H 'Content-Type: application/json' -d '{\"prompt\": \"Hello\"}'",
       "withTimeout": "curl -X POST http://localhost:3000/chat -H 'Content-Type: application/json' -d '{\"prompt\": \"Complex task\"}' --max-time 180"
     }
   },
@@ -145,7 +212,7 @@
   "errorHandling": {
     "connectionRefused": {
       "cause": "Controller not running or Chrome not connected",
-      "solution": "1. Start Chrome with debugging port\n2. Open AI Studio and log in\n3. Start controller: node lotl-controller-v2.js"
+      "solution": "1. Start Chrome with debugging port\n2. Open AI Studio and log in\n3. Start controller: npm run start:local"
     },
     "timeout": {
       "cause": "AI Studio taking too long or stuck",

@@ -2,9 +2,14 @@
   "name": "lotl-agent",
   "version": "1.0.0",
   "description": "Living off the Land Controller - Connects to Chrome to automate AI chat interfaces",
-  "main": "lotl-controller.js",
+  "main": "lotl-controller-v3.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
-    "start": "node lotl-controller.js",
+    "start": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& node lotl-controller-v3.js",
+    "start:local": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& set HOST=127.0.0.1&& node lotl-controller-v3.js",
+    "start:lan": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& set HOST=0.0.0.0&& node lotl-controller-v3.js",
     "launch-chrome": "start chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\temp\\chrome-lotl"
   },
   "keywords": [

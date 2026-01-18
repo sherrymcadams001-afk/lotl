@@ -6,6 +6,7 @@ import base64
 import httpx
 from pathlib import Path
 from typing import Union, Optional, List
+from urllib.parse import urlparse
 
 
 class LotLClient:
@@ -31,7 +32,8 @@ class LotLClient:
     def __init__(
         self,
         base_url: str = "http://localhost:3000",
-        timeout: float = 180.0
+        timeout: float = 300.0,
+        endpoint: Optional[str] = None
     ):
         """
         Initialize the LotL client.
@@ -40,8 +42,49 @@ class LotLClient:
             base_url: Controller URL (default: http://localhost:3000)
             timeout: Request timeout in seconds (default: 180)
         """
-        self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+
+        resolved_base_url = base_url
+        primary_path = "/aistudio"
+
+        if endpoint:
+            parsed = urlparse(endpoint)
+            if parsed.scheme and parsed.netloc:
+                resolved_base_url = f"{parsed.scheme}://{parsed.netloc}"
+                if parsed.path and parsed.path != "/":
+                    primary_path = parsed.path
+            else:
+                resolved_base_url = endpoint
+
+        self.base_url = resolved_base_url.rstrip("/")
+        self._primary_path = primary_path
+
+    @property
+    def endpoint(self) -> str:
+        """Backward-compatible full endpoint URL string."""
+        return f"{self.base_url}{self._primary_path}"
+
+    def _post_chat(self, payload: dict, timeout: float) -> dict:
+        """POST to the preferred endpoint, falling back to v3 /aistudio then legacy /chat."""
+        with httpx.Client(timeout=timeout) as client:
+            candidates = [self._primary_path, "/aistudio", "/chat"]
+            seen = set()
+
+            last_response: Optional[httpx.Response] = None
+            for path in candidates:
+                if path in seen:
+                    continue
+                seen.add(path)
+                last_response = client.post(f"{self.base_url}{path}", json=payload)
+                if last_response.status_code == 404:
+                    continue
+                last_response.raise_for_status()
+                return last_response.json()
+
+            if last_response is None:
+                raise RuntimeError("No endpoint candidates were attempted")
+            last_response.raise_for_status()
+            return last_response.json()
     
     def _encode_image(self, image: Union[str, bytes, Path]) -> str:
         """
@@ -141,17 +184,12 @@ class LotLClient:
             payload["images"] = [self._encode_image(img) for img in images]
         
         try:
-            with httpx.Client(timeout=timeout or self.timeout) as client:
-                response = client.post(
-                    f"{self.base_url}/chat",
-                    json=payload
-                )
-                data = response.json()
-                
-                if data.get("success"):
-                    return data["reply"]
-                else:
-                    raise RuntimeError(data.get("error", "Unknown error"))
+            data = self._post_chat(payload, timeout=timeout or self.timeout)
+
+            if data.get("success"):
+                return data["reply"]
+            else:
+                raise RuntimeError(data.get("error", "Unknown error"))
                     
         except httpx.ConnectError:
             raise ConnectionError(
@@ -189,10 +227,10 @@ class LotLClient:
         
         try:
             async with httpx.AsyncClient(timeout=timeout or self.timeout) as client:
-                response = await client.post(
-                    f"{self.base_url}/chat",
-                    json=payload
-                )
+                response = await client.post(f"{self.base_url}/aistudio", json=payload)
+                if response.status_code == 404:
+                    response = await client.post(f"{self.base_url}/chat", json=payload)
+                response.raise_for_status()
                 data = response.json()
                 
                 if data.get("success"):

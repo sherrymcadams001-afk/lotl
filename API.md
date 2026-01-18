@@ -12,18 +12,31 @@ Start-Process "chrome.exe" -ArgumentList "--remote-debugging-port=9222", "--user
 
 # 3. Start the controller
 cd lotl-agent
-node lotl-controller-v2.js
+npm install
+npm run start:local
 
-# 4. Send requests to http://localhost:3000/chat
+# 4. Send requests to http://localhost:3000/aistudio (or legacy /chat)
 ```
 
 ---
 
 ## API Endpoints
 
-### POST `/chat`
+### GET `/ready`
+
+Readiness probe. Returns `200` when the controller can reach Chrome debug port and detect the AI Studio tab + input selector.
+
+```bash
+curl http://localhost:3000/ready
+```
+
+---
+
+### POST `/aistudio`
 
 Send a prompt (with optional images) to AI Studio.
+
+> Legacy: `POST /chat` is still supported and maps `target=gemini` → AI Studio.
 
 #### Request
 
@@ -94,7 +107,7 @@ Health check endpoint.
 import requests
 import base64
 
-LOTL_ENDPOINT = "http://localhost:3000/chat"
+LOTL_ENDPOINT = "http://localhost:3000/aistudio"
 
 # Simple text prompt
 def ask_lotl(prompt: str, images: list = None) -> str:
@@ -119,13 +132,17 @@ def ask_with_image(prompt: str, image_path: str) -> str:
 # Usage
 result = ask_lotl("What is 2 + 2?")
 print(result)  # "4"
+
+# Readiness check
+ready = requests.get('http://localhost:3000/ready', timeout=5).json()
+print('ready:', ready.get('ok'))
 ```
 
 ### JavaScript/Node.js
 
 ```javascript
 async function askLotL(prompt, images = []) {
-  const response = await fetch('http://localhost:3000/chat', {
+  const response = await fetch('http://localhost:3000/aistudio', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt, images })
@@ -148,7 +165,7 @@ console.log(answer);
 
 ```bash
 # Simple prompt
-curl -X POST http://localhost:3000/chat \
+curl -X POST http://localhost:3000/aistudio \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Hello, what is your name?"}' \
   --max-time 120
@@ -164,7 +181,7 @@ $body = @{
     prompt = "What is the meaning of life?"
 } | ConvertTo-Json
 
-$response = Invoke-RestMethod -Uri "http://localhost:3000/chat" `
+$response = Invoke-RestMethod -Uri "http://localhost:3000/aistudio" `
     -Method POST `
     -ContentType "application/json" `
     -Body $body `
@@ -305,7 +322,7 @@ google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-lotl
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| `Cannot connect to LotL Controller` | Controller not running | Start: `node lotl-controller-v2.js` |
+| `Cannot connect to LotL Controller` | Controller not running | Start: `npm run start:local` |
 | `AI Studio tab not found` | Chrome not open or AI Studio not loaded | Open https://aistudio.google.com in debugging Chrome |
 | `Timeout waiting for response` | AI Studio slow or stuck | Check AI Studio tab, may need new chat session |
 | `Empty response` | Parsing failed | Check AI Studio for errors, restart chat |
@@ -339,7 +356,7 @@ This system uses a logged-in session, so there are **no API quotas**. However:
 
 ```
 lotl-agent/
-├── lotl-controller-v2.js    # Main controller server
+├── lotl-controller-v3.js    # Main controller server
 ├── api-schema.json          # OpenAPI-style schema
 ├── API.md                   # This documentation
 ├── debug-upload-selectors.js # Tool to discover UI selectors
@@ -358,5 +375,6 @@ Browser-use/
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 3.0.0 | 2025-01 | Separate endpoints (`/aistudio`, `/chatgpt`), readiness probe (`/ready`), hardened DOM-first controller |
 | 2.0.0 | 2024-12 | Image upload via Google Drive, FileChooser API |
 | 1.0.0 | 2024-12 | Initial release, text-only |

@@ -22,7 +22,7 @@ class TestLotLClient:
         from lotl import LotLClient
         
         client = LotLClient()
-        assert client.endpoint == "http://localhost:3000/chat"
+        assert client.endpoint == "http://localhost:3000/aistudio"
         assert client.timeout == 300.0
         
         client2 = LotLClient(endpoint="http://custom:8000/chat", timeout=60)
@@ -74,35 +74,39 @@ class TestLotLClient:
         
         assert result == already_encoded
     
-    @patch('httpx.post')
-    def test_chat_success(self, mock_post):
+    @patch('lotl.client.httpx.Client')
+    def test_chat_success(self, mock_client_cls):
         """Test successful chat request."""
         from lotl.client import LotLClient
-        
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "success": True,
-            "reply": "Hello, world!"
-        }
-        mock_post.return_value = mock_response
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"success": True, "reply": "Hello, world!"}
+        mock_client.post.return_value = mock_response
         
         client = LotLClient()
         result = client.chat("Hello")
         
         assert result == "Hello, world!"
-        mock_post.assert_called_once()
+        mock_client.post.assert_called_once()
     
-    @patch('httpx.post')
-    def test_chat_error(self, mock_post):
+    @patch('lotl.client.httpx.Client')
+    def test_chat_error(self, mock_client_cls):
         """Test error handling in chat."""
         from lotl.client import LotLClient
-        
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value.__enter__.return_value = mock_client
+
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "success": False,
-            "error": "Something went wrong"
-        }
-        mock_post.return_value = mock_response
+        mock_response.status_code = 200
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {"success": False, "error": "Something went wrong"}
+        mock_client.post.return_value = mock_response
         
         client = LotLClient()
         
@@ -164,7 +168,7 @@ class TestLangChain:
         
         llm = ChatLotL()
         assert llm.model == "gemini-lotl"
-        assert llm.endpoint == "http://localhost:3000/chat"
+        assert llm.endpoint == "http://localhost:3000/aistudio"
 
 
 class TestCLI:

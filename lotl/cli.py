@@ -100,10 +100,16 @@ def cmd_ask(args):
     
     try:
         response = httpx.post(
-            f"http://localhost:{args.port}/chat",
+            f"http://localhost:{args.port}/aistudio",
             json={"prompt": prompt},
             timeout=args.timeout
         )
+        if response.status_code == 404:
+            response = httpx.post(
+                f"http://localhost:{args.port}/chat",
+                json={"prompt": prompt},
+                timeout=args.timeout
+            )
         data = response.json()
         
         if data.get("success"):

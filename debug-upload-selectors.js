@@ -256,7 +256,7 @@ async function discoverSelectors() {
         
         console.log('\n' + '=' .repeat(60));
         console.log('🏁 Discovery complete!');
-        console.log('\nUpdate the selectors in lotl-controller-v2.js based on these findings.');
+        console.log('\nUpdate the selectors in lotl-controller-v3.js based on these findings.');
         
         // Don't disconnect - leave Chrome session intact
         

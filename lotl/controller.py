@@ -43,7 +43,7 @@ class LotLController:
         Args:
             port: Port for the controller server (default: 3000)
             chrome_port: Chrome debugging port (default: 9222)
-            controller_path: Path to lotl-controller-v2.js (auto-detected)
+            controller_path: Path to lotl-controller-v3.js (auto-detected)
         """
         self.port = port
         self.chrome_port = chrome_port
@@ -52,6 +52,8 @@ class LotLController:
         # Find controller script
         if controller_path:
             self.controller_path = Path(controller_path)
+            if not self.controller_path.exists():
+                raise FileNotFoundError(f"Controller script not found: {self.controller_path}")
         else:
             self.controller_path = self._find_controller()
     
@@ -59,10 +61,10 @@ class LotLController:
         """Find the controller script."""
         # Check common locations
         search_paths = [
-            Path(__file__).parent / "controller" / "lotl-controller-v2.js",
-            Path(__file__).parent.parent / "lotl-controller-v2.js",
-            Path.cwd() / "lotl-controller-v2.js",
-            Path.cwd() / "lotl-agent" / "lotl-controller-v2.js",
+            Path(__file__).parent / "controller" / "lotl-controller-v3.js",
+            Path(__file__).parent.parent / "lotl-controller-v3.js",
+            Path.cwd() / "lotl-controller-v3.js",
+            Path.cwd() / "lotl-agent" / "lotl-controller-v3.js",
         ]
         
         for path in search_paths:
@@ -70,7 +72,7 @@ class LotLController:
                 return path
         
         raise FileNotFoundError(
-            "Cannot find lotl-controller-v2.js. "
+            "Cannot find lotl-controller-v3.js. "
             "Please specify controller_path or ensure the file exists."
         )
     
@@ -113,10 +115,7 @@ class LotLController:
                 timeout=2.0
             )
             pages = response.json()
-            return any(
-                p.get("url", "").startswith("https://aistudio.google.com")
-                for p in pages
-            )
+            return any("aistudio.google.com" in (p.get("url", "") or "") for p in pages)
         except:
             return False
     

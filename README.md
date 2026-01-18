@@ -1,146 +1,98 @@
-# 🤖 LotL Controller (Living off the Land)
+# LotL Controller (Local AI Studio + ChatGPT via Chrome)
 
-A hybrid controller that connects to your existing Chrome browser to automate AI chat interfaces like **Gemini AI Studio** and **ChatGPT**.
+LotL is a local HTTP controller that attaches to an existing Chrome session (via CDP) and drives:
+- **AI Studio (Gemini)**: `POST /aistudio` (text + images)
+- **ChatGPT**: `POST /chatgpt` (text-only)
 
-## Features
+It’s designed for stability: readiness probing, per-provider locking, DOM-first interaction, and image upload support for AI Studio.
 
-- **Stealth Input**: Uses Puppeteer for human-like typing
-- **Network-based Timing**: Monitors backend API calls for robust response detection
-- **Self-Healing Selectors**: Tries multiple selector strategies to handle UI changes
-- **REST API**: Simple HTTP interface for integration
+## Prereqs
 
-## Installation
+- Node.js 18+
+- Google Chrome launched with `--remote-debugging-port=9222`
+- Logged-in tabs open:
+    - https://aistudio.google.com (required)
+    - https://chatgpt.com (optional, only for `/chatgpt`)
 
-Requires Node.js installed.
+## Install
 
-```bash
+```powershell
 cd lotl-agent
-npm install puppeteer-core express body-parser
+npm install
 ```
 
-## Setup
+## Start
 
-### 1. Launch Chrome with Remote Debugging
+### 1) Launch Chrome with remote debugging
 
-You must launch Chrome with the debugging port enabled.
-
-**Windows (PowerShell):**
 ```powershell
 Start-Process "chrome.exe" -ArgumentList "--remote-debugging-port=9222", "--user-data-dir=C:\temp\chrome-lotl"
 ```
 
-**Mac:**
-```bash
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir="/tmp/chrome-lotl"
-```
+### 2) Start the controller
 
-**Linux:**
-```bash
-google-chrome --remote-debugging-port=9222 --user-data-dir="/tmp/chrome-lotl"
-```
-
-### 2. Log In to AI Services
-
-In the new Chrome window, manually log in to:
-- `https://aistudio.google.com` (for Gemini)
-- `https://chatgpt.com` (for ChatGPT)
-
-Keep these tabs open.
-
-### 3. Run the Controller
-
-```bash
-node lotl-controller.js
-```
-
-You should see:
-```
-🚀 LotL Controller running on port 3000
-```
-
-## Usage
-
-### Test via Terminal (curl)
-
-**Gemini:**
-```bash
-curl -X POST http://localhost:3000/chat -H "Content-Type: application/json" -d "{\"target\": \"gemini\", \"prompt\": \"Write a haiku about hackers.\"}"
-```
-
-**ChatGPT:**
-```bash
-curl -X POST http://localhost:3000/chat -H "Content-Type: application/json" -d "{\"target\": \"chatgpt\", \"prompt\": \"Explain JSON in one sentence.\"}"
-```
-
-### PowerShell
+Local-only bind (recommended):
 
 ```powershell
-Invoke-RestMethod -Uri "http://localhost:3000/chat" -Method Post -ContentType "application/json" -Body '{"target": "gemini", "prompt": "Hello, Gemini!"}'
+npm run start:local
 ```
 
-### Python Integration
+LAN bind (only if you need it):
 
-```python
-import requests
-
-response = requests.post('http://localhost:3000/chat', json={
-    'target': 'gemini',
-    'prompt': 'Explain quantum computing in simple terms.'
-})
-
-print(response.json()['reply'])
+```powershell
+npm run start:lan
 ```
 
-## API Reference
+## Verify
 
-### POST /chat
-
-Send a prompt to an AI service.
-
-**Request Body:**
-```json
-{
-    "target": "gemini",  // or "chatgpt"
-    "prompt": "Your message here"
-}
+```powershell
+curl http://127.0.0.1:3000/health
+curl http://127.0.0.1:3000/ready
 ```
 
-**Response:**
-```json
-{
-    "success": true,
-    "reply": "The AI's response..."
-}
+`/ready` should return `ok: true` and show an AI Studio URL + `hasInput: true`.
+
+## Use
+
+### AI Studio (text)
+
+```powershell
+$body = @{ prompt = "Reply with just OK" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:3000/aistudio" -Method Post -ContentType "application/json" -Body $body -TimeoutSec 90
 ```
 
-**Error Response:**
-```json
-{
-    "success": false,
-    "error": "Error message"
-}
+### AI Studio (image)
+
+Send base64 *data URLs*:
+
+```powershell
+$img = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+$body = @{ prompt = "What color is this image? Reply with just the color."; images = @($img) } | ConvertTo-Json -Depth 3
+Invoke-RestMethod -Uri "http://127.0.0.1:3000/aistudio" -Method Post -ContentType "application/json" -Body $body -TimeoutSec 120
 ```
 
-## Supported Adapters
+### ChatGPT (text-only)
 
-| Target | Service | URL |
-|--------|---------|-----|
-| `gemini` | Google AI Studio | aistudio.google.com |
-| `chatgpt` | ChatGPT | chatgpt.com |
+```powershell
+$body = @{ prompt = "Say hello" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:3000/chatgpt" -Method Post -ContentType "application/json" -Body $body -TimeoutSec 90
+```
+
+### Legacy endpoint (backward-compatible)
+
+```powershell
+$body = @{ target = "gemini"; prompt = "Hello" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:3000/chat" -Method Post -ContentType "application/json" -Body $body -TimeoutSec 90
+```
 
 ## Troubleshooting
 
-### "Connection failed. Is Chrome running on port 9222?"
-- Make sure Chrome is launched with `--remote-debugging-port=9222`
-- Check if port 9222 is not blocked by firewall
-
-### "Tab for X not found"
-- Open the correct tab in Chrome (aistudio.google.com or chatgpt.com)
-- Make sure you're logged in
-
-### "UI Helper: Could not find element"
-- The UI may have changed. Check the selectors in `ADAPTERS` config
-- Try refreshing the page in Chrome
+- `/ready` is `503` / `ok:false`
+    - Ensure Chrome is launched with `--remote-debugging-port=9222` and AI Studio is open + logged in.
+- Requests hang or time out
+    - Bring the AI Studio tab to the foreground and ensure it’s not showing a security prompt.
+- `npm run start:*` says `node` not found
+    - Scripts auto-extend `PATH`, but if you’re in a custom environment, use the full path: `C:\Program Files\nodejs\node.exe lotl-controller-v3.js`.
 
 ## Architecture
 

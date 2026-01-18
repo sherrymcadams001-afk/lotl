@@ -153,7 +153,7 @@ lotl stop
 
 ```python
 client = LotLClient(
-    endpoint="http://localhost:3000/chat",
+    base_url="http://localhost:3000",
     timeout=300.0
 )
 
@@ -167,9 +167,11 @@ client.is_available()
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/chat` | POST | Send prompt, get response |
+| `/aistudio` | POST | Send prompt (and optional images) to AI Studio |
+| `/chatgpt` | POST | Send prompt to ChatGPT (text-only) |
+| `/chat` | POST | Legacy unified endpoint (backward-compatible) |
+| `/ready` | GET | Readiness probe (Chrome + AI Studio tab + selectors) |
 | `/health` | GET | Health check |
-| `/reset` | POST | Reset conversation |
 
 ## Architecture
 

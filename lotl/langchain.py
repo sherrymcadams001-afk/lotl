@@ -65,7 +65,7 @@ class ChatLotL(BaseChatModel if LANGCHAIN_AVAILABLE else object):
     """
     
     model: str = "gemini-lotl"
-    endpoint: str = "http://localhost:3000/chat"
+    endpoint: str = "http://localhost:3000/aistudio"
     timeout: int = 300
     
     def __init__(self, **kwargs):
