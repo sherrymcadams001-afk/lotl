@@ -48,8 +48,10 @@ const CHROME_DEBUG_PORT = Number(process.env.CHROME_PORT || 9222);
 const READY_TIMEOUT_MS = Number(process.env.READY_TIMEOUT_MS || 5000);
 const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 8000);
 const PUPPETEER_PROTOCOL_TIMEOUT_MS = Number(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS || 120000);
-const LOCK_TIMEOUT_MS_TEXT = Number(process.env.LOCK_TIMEOUT_MS_TEXT || 180000);
-const LOCK_TIMEOUT_MS_IMAGES = Number(process.env.LOCK_TIMEOUT_MS_IMAGES || 480000);
+// NOTE: The request path can take > 180s (generation + streaming + fallbacks).
+// Defaults are set conservatively to avoid "Lock timeout" errors under slow UI/network conditions.
+const LOCK_TIMEOUT_MS_TEXT = Number(process.env.LOCK_TIMEOUT_MS_TEXT || 420000);
+const LOCK_TIMEOUT_MS_IMAGES = Number(process.env.LOCK_TIMEOUT_MS_IMAGES || 900000);
 
 function nowIso() {
     return new Date().toISOString();
@@ -109,14 +111,57 @@ async function fetchJsonWithTimeout(url, timeoutMs) {
     }
 }
 
+function cleanExtractedLines(text) {
+    const raw = (text || '').replace(/\r\n/g, '\n');
+    const artifactPatterns = [
+        /^\s*edit\s*$/i, /^\s*more_vert\s*$/i,
+        /^\s*thumb_up\s*$/i, /^\s*thumb_down\s*$/i,
+        /^\s*content_copy\s*$/i, /^\s*model\s*$/i,
+        /^\s*user\s*$/i, /^\s*\d+\.?\d*s\s*$/,
+        /^\s*help\s*$/i, /^\s*sources?\s*$/i,
+        /^\s*more options\s*$/i,
+        /^\s*thoughts\s*$/i,
+        /Expand to view model thoughts/i,
+        /^\s*chevron_right\s*$/i,
+        /Google Search Suggestions?.*/i,
+        /Grounding with Google Search.*/i,
+        /Learn more.*/i
+    ];
+
+    const lines = raw
+        .split('\n')
+        .map(l => (l || '').trim())
+        .filter(Boolean)
+        .filter(line => !artifactPatterns.some(p => p.test(line)));
+
+    // De-dupe adjacent identical lines
+    const deduped = [];
+    for (const line of lines) {
+        if (deduped.length === 0 || deduped[deduped.length - 1] !== line) {
+            deduped.push(line);
+        }
+    }
+
+    let result = deduped.join('\n').trim();
+    if (result.startsWith('Model')) result = result.substring(5).trim();
+    result = result.replace(/\[\d+\]/g, '');
+    return result.trim();
+}
+
+function parseExpectedExactToken(prompt) {
+    const s = String(prompt || '');
+    const m = /Reply\s+with\s+exactly:\s*([^\r\n]+)\s*/i.exec(s);
+    return m ? String(m[1] || '').trim() : null;
+}
+
 // ========== PLATFORM ADAPTERS ==========
 const ADAPTERS = {
     aistudio: {
         name: 'AI Studio (Gemini)',
         urlPattern: 'aistudio.google.com',
         selectors: {
-            input: 'footer textarea',
-            runButton: 'button[aria-label*="Run"]',
+            input: 'footer textarea, textarea, div[contenteditable="true"]',
+            runButton: 'button[aria-label*="Run"], button[aria-label*="Send"], button[aria-label*="Submit"]',
             stopButton: 'button[aria-label*="Stop"]',
             turn: 'ms-chat-turn',
             bubble: 'ms-chat-bubble',
@@ -125,34 +170,90 @@ const ADAPTERS = {
         // DOM-based input method
         setInput: async (page, text) => {
             return await page.evaluate((txt) => {
-                const textarea = document.querySelector('footer textarea');
-                if (!textarea) return false;
-                
-                // Focus and clear
-                textarea.focus();
-                textarea.value = '';
-                
-                // Set value and fire events
-                textarea.value = txt;
-                textarea.dispatchEvent(new Event('input', { bubbles: true }));
-                textarea.dispatchEvent(new Event('change', { bubbles: true }));
-                
-                // Angular-specific: trigger ngModelChange
-                const ngModel = textarea.getAttribute('ng-model') || 
-                               textarea.getAttribute('[(ngModel)]');
-                if (ngModel) {
-                    textarea.dispatchEvent(new CustomEvent('ngModelChange', { 
-                        detail: txt, bubbles: true 
-                    }));
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (!style) return false;
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                    const r = el.getBoundingClientRect();
+                    return r && r.width > 10 && r.height > 10;
+                };
+
+                const pickBest = (els) => {
+                    const visible = Array.from(els || []).filter(isVisible);
+                    if (visible.length === 0) return null;
+                    // Prefer the largest visible element (usually the actual prompt box)
+                    visible.sort((a, b) => {
+                        const ra = a.getBoundingClientRect();
+                        const rb = b.getBoundingClientRect();
+                        return (rb.width * rb.height) - (ra.width * ra.height);
+                    });
+                    return visible[0];
+                };
+
+                const textarea = pickBest(document.querySelectorAll('footer textarea, textarea'));
+                if (textarea) {
+                    textarea.focus();
+                    textarea.value = '';
+                    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                    textarea.dispatchEvent(new Event('change', { bubbles: true }));
+
+                    textarea.value = txt;
+                    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+                    textarea.dispatchEvent(new Event('change', { bubbles: true }));
+
+                    // Angular-specific: trigger ngModelChange if present
+                    const ngModel = textarea.getAttribute('ng-model') || textarea.getAttribute('[(ngModel)]');
+                    if (ngModel) {
+                        textarea.dispatchEvent(new CustomEvent('ngModelChange', { detail: txt, bubbles: true }));
+                    }
+
+                    return textarea.value === txt;
                 }
-                
-                return textarea.value === txt;
+
+                const editable = pickBest(document.querySelectorAll('div[contenteditable="true"]'));
+                if (editable) {
+                    editable.focus();
+                    editable.textContent = '';
+                    editable.dispatchEvent(new Event('input', { bubbles: true }));
+                    editable.textContent = txt;
+                    editable.dispatchEvent(new Event('input', { bubbles: true }));
+                    return (editable.textContent || '').trim() === txt.trim();
+                }
+
+                return false;
             }, text);
         },
         // DOM-based run trigger
         clickRun: async (page) => {
+            // Prefer Ctrl+Enter because it targets the focused prompt field,
+            // avoiding ambiguity when there are multiple visible Run buttons.
+            try {
+                await page.keyboard.down('Control');
+                await page.keyboard.press('Enter');
+                await page.keyboard.up('Control');
+                return true;
+            } catch {}
+
+            // Fallback to clicking a visible Run/Send button.
             return await page.evaluate(() => {
-                const btn = document.querySelector('button[aria-label*="Run"]');
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (!style) return false;
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                    const r = el.getBoundingClientRect();
+                    return r && r.width > 6 && r.height > 6;
+                };
+
+                const candidates = Array.from(document.querySelectorAll(
+                    'button[aria-label*="Run"], button[aria-label*="Send"], button[aria-label*="Submit"]'
+                ))
+                    .filter(isVisible)
+                    .filter((b) => !b.disabled && b.getAttribute('aria-disabled') !== 'true');
+
+                candidates.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+                const btn = candidates[0];
                 if (!btn) return false;
                 btn.click();
                 return true;
@@ -309,76 +410,100 @@ const ADAPTERS = {
             console.log('📷 Image upload step complete');
         },
         // DOM-based response extraction
+        // NOTE: Do NOT clone custom elements here. cloneNode() does not preserve shadow DOM
+        // and often results in empty innerText.
         extractResponse: async (page) => {
             return await page.evaluate(() => {
+                function deepText(node) {
+                    if (!node) return '';
+                    // Text node
+                    if (node.nodeType === Node.TEXT_NODE) {
+                        return node.nodeValue || '';
+                    }
+                    // Element node
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        const el = /** @type {HTMLElement} */ (node);
+                        const tag = (el.tagName || '').toLowerCase();
+
+                        // Skip obvious UI noise
+                        if (tag === 'button' || tag === 'mat-icon') return '';
+                        const cls = (el.className && String(el.className)) ? String(el.className).toLowerCase() : '';
+                        if (cls.includes('icon') || cls.includes('action') || cls.includes('menu') || cls.includes('feedback')) return '';
+                        const aria = (el.getAttribute && el.getAttribute('aria-label')) ? String(el.getAttribute('aria-label')).toLowerCase() : '';
+                        if (aria.includes('copy') || aria.includes('thumb') || aria.includes('rate') || aria.includes('feedback')) return '';
+
+                        let out = '';
+                        // Light separators for block-ish elements
+                        if (tag === 'br') return '\n';
+
+                        // Walk light DOM
+                        if (el.childNodes && el.childNodes.length) {
+                            for (const child of el.childNodes) {
+                                out += deepText(child);
+                            }
+                        }
+                        // Walk shadow DOM
+                        const sr = /** @type {any} */ (el).shadowRoot;
+                        if (sr && sr.childNodes && sr.childNodes.length) {
+                            for (const child of sr.childNodes) {
+                                out += deepText(child);
+                            }
+                        }
+
+                        // Add newlines after common block containers
+                        if (tag === 'p' || tag === 'div' || tag === 'li' || tag === 'pre' || tag === 'section' || tag === 'article') {
+                            out += '\n';
+                        }
+
+                        return out;
+                    }
+                    return '';
+                }
+
+                function cleanTurnText(raw) {
+                    let t = String(raw || '');
+                    t = t.replace(/\r\n/g, '\n');
+
+                    // Remove common UI tokens that appear inline.
+                    t = t.replace(/\b(edit|more_vert|thumb_up|thumb_down|content_copy|download)\b/gi, ' ');
+                    t = t.replace(/\b\d+(?:\.\d+)?s\b/g, ' ');
+                    t = t.replace(/\s+/g, ' ').trim();
+
+                    // Strip leading role labels.
+                    t = t.replace(/^\s*(User|Model)\s+/i, '');
+
+                    // Remove citation brackets.
+                    t = t.replace(/\[\d+\]/g, '');
+
+                    return t.trim();
+                }
+
                 const turns = document.querySelectorAll('ms-chat-turn');
                 if (turns.length === 0) return null;
 
-                // AI Studio appends multiple turns; pick the latest turn that has a non-empty bubble.
-                let chosen = null;
+                // Prefer the most recent Model turn (avoid returning the user prompt).
+                let best = null;
                 for (let i = turns.length - 1; i >= 0; i--) {
                     const t = turns[i];
-                    const bubble = t.querySelector('ms-chat-bubble');
-                    const txt = (bubble ? bubble.innerText : t.innerText) || '';
-                    if (txt.trim().length > 0) {
-                        chosen = t;
-                        break;
+                    let raw = (t.innerText || '').trim();
+                    if (!raw) raw = deepText(t);
+                    if (!raw || raw.trim().length === 0) continue;
+
+                    const cleaned = cleanTurnText(raw);
+                    if (!cleaned) continue;
+
+                    const looksLikeModel = /\bModel\b/i.test(raw);
+                    const looksLikeUser = /\bUser\b/i.test(raw);
+
+                    if (looksLikeModel && !looksLikeUser) {
+                        return cleaned;
                     }
+
+                    // Keep as fallback in case we can't find a Model-labelled turn.
+                    if (!best) best = cleaned;
                 }
 
-                const lastTurn = chosen || turns[turns.length - 1];
-                const clone = lastTurn.cloneNode(true);
-                
-                // Remove all UI clutter
-                const removeSelectors = [
-                    'button', 'mat-icon', '[class*="icon"]', 
-                    '[class*="action"]', '[class*="menu"]',
-                    '[class*="feedback"]', '[class*="rating"]',
-                    '[class*="copy"]', '[class*="grounding"]',
-                    '[class*="source"]', '.sources', '.citation',
-                    'ms-feedback-buttons', 'ms-tooltip'
-                ];
-                removeSelectors.forEach(sel => {
-                    clone.querySelectorAll(sel).forEach(el => el.remove());
-                });
-                
-                // Get text from bubble first
-                const bubble = clone.querySelector('ms-chat-bubble');
-                let text = bubble ? bubble.innerText : clone.innerText;
-                text = (text || '').trim();
-                
-                // Clean artifacts
-                const artifactPatterns = [
-                    /^\s*edit\s*$/i, /^\s*more_vert\s*$/i,
-                    /^\s*thumb_up\s*$/i, /^\s*thumb_down\s*$/i,
-                    /^\s*content_copy\s*$/i, /^\s*model\s*$/i,
-                    /^\s*user\s*$/i, /^\s*\d+\.?\d*s\s*$/,
-                    /^\s*help\s*$/i, /^\s*sources?\s*$/i,
-                    /Google Search Suggestions?.*/i,
-                    /Grounding with Google Search.*/i,
-                    /Learn more.*/i
-                ];
-                
-                const lines = text.split('\n').filter(line => {
-                    const trimmed = line.trim();
-                    if (!trimmed) return false;
-                    for (const pattern of artifactPatterns) {
-                        if (pattern.test(trimmed)) return false;
-                    }
-                    return true;
-                });
-                
-                let result = lines.join('\n').trim();
-                
-                // Remove leading "Model" label
-                if (result.startsWith('Model')) {
-                    result = result.substring(5).trim();
-                }
-                
-                // Remove citation brackets
-                result = result.replace(/\[\d+\]/g, '');
-                
-                return result;
+                return best;
             });
         },
         // Get current turn count
@@ -624,6 +749,229 @@ class LotlController {
         this._locks[platform] = run.catch(() => undefined);
         return Promise.race([run, timeout]);
     }
+
+    async extractFallback(platform, page, anchorText) {
+        if (platform !== 'aistudio') return null;
+
+        // Fallback: (1) try the accessibility tree, then (2) try a CDP DOMSnapshot.
+        // Both help when the UI moves content into closed/shadow DOM where innerText/textContent appear empty.
+        try {
+            const turns = await page.$$('ms-chat-turn');
+            if (!turns || turns.length === 0) return null;
+
+            const expected = parseExpectedExactToken(anchorText);
+
+            const pieces = [];
+            const visit = (node) => {
+                if (!node) return;
+                if (typeof node.name === 'string' && node.name.trim()) pieces.push(node.name.trim());
+                if (typeof node.value === 'string' && node.value.trim()) pieces.push(node.value.trim());
+                if (Array.isArray(node.children)) {
+                    for (const c of node.children) visit(c);
+                }
+            };
+
+            // Scan a handful of recent turns; UI changes sometimes make innerText useless.
+            const start = Math.max(0, turns.length - 6);
+            for (let i = turns.length - 1; i >= start; i--) {
+                pieces.length = 0;
+                const snapshot = await page.accessibility.snapshot({ root: turns[i] });
+                if (!snapshot) continue;
+                visit(snapshot);
+                const raw = pieces.join('\n');
+                const cleaned = cleanExtractedLines(raw);
+                if (!cleaned) continue;
+                if (/Expand to view model thoughts/i.test(cleaned)) continue;
+
+                // If we're expecting a specific token, prefer returning just that token.
+                if (expected && raw.includes(expected) && !/Reply\s+with\s+exactly:/i.test(raw)) {
+                    return expected;
+                }
+                return cleaned;
+            }
+
+            // Accessibility didn't expose the model text; fall back to a DOMSnapshot.
+            try {
+                const client = await page.target().createCDPSession();
+                const snap = await client.send('DOMSnapshot.captureSnapshot', {
+                    computedStyles: [],
+                    includePaintOrder: false,
+                    includeDOMRects: false,
+                    includeBlendedBackgroundColors: false,
+                    includeTextColorOpacity: false,
+                });
+
+                const strings = Array.isArray(snap.strings) ? snap.strings : [];
+                const doc = snap && Array.isArray(snap.documents) ? snap.documents[0] : null;
+                if (!doc || !doc.nodes || !Array.isArray(doc.nodes.nodeValue)) return null;
+
+                const decode = (idx) => (typeof idx === 'number' ? (strings[idx] || '') : '');
+
+                const nodeCount = Array.isArray(doc.nodes.nodeName) ? doc.nodes.nodeName.length : 0;
+                const parentIndex = Array.isArray(doc.nodes.parentIndex) ? doc.nodes.parentIndex : [];
+
+                // Prefer extracting within the most recent chat turn subtree that actually contains content.
+                const turnIndices = [];
+                if (Array.isArray(doc.nodes.nodeName)) {
+                    for (let i = 0; i < nodeCount; i++) {
+                        const name = decode(doc.nodes.nodeName[i]).toUpperCase();
+                        if (name === 'MS-CHAT-TURN') turnIndices.push(i);
+                    }
+                }
+
+                const isDescendantOf = (nodeIdx, ancestorIdx) => {
+                    if (ancestorIdx < 0) return false;
+                    let cur = nodeIdx;
+                    let guard = 0;
+                    while (cur >= 0 && guard++ < 8000) {
+                        if (cur === ancestorIdx) return true;
+                        cur = parentIndex[cur];
+                    }
+                    return false;
+                };
+
+                const extractTurnTexts = (turnIdx) => {
+                    const out = [];
+                    for (let i = 0; i < nodeCount; i++) {
+                        if (!isDescendantOf(i, turnIdx)) continue;
+                        const s = decode(doc.nodes.nodeValue[i]);
+                        if (!s) continue;
+                        const t = s.replace(/\s+/g, ' ').trim();
+                        if (!t) continue;
+                        if (t.length > 2000) continue;
+                        if (t.startsWith('{') && t.includes('"') && t.includes(':')) continue;
+                        if (t.includes('function ') || t.includes('var _F_')) continue;
+                        out.push(t);
+                    }
+                    return out;
+                };
+
+                // Anchor to the current prompt (when possible), then extract from the following turn(s).
+                const anchor = String(anchorText || '').trim();
+                const expected = parseExpectedExactToken(anchor);
+                const anchorForSearch = expected || anchor;
+
+                if (expected) {
+                    for (let i = 0; i < nodeCount; i++) {
+                        const s = decode(doc.nodes.nodeValue[i]);
+                        if (!s) continue;
+                        if (String(s).trim() === expected) {
+                            return expected;
+                        }
+                    }
+                }
+
+                const turnNoise = [
+                    /^More options$/i,
+                    /^Send prompt \(Ctrl \+ Enter\)$/i,
+                    /^Enter a prompt$/i,
+                    /^Run$/i,
+                    /^Stop$/i,
+                ];
+
+                const maxTurnsToInspect = 14;
+                const turnScanStart = Math.max(0, turnIndices.length - maxTurnsToInspect);
+                let anchorTurnPos = -1;
+
+                if (anchorForSearch) {
+                    for (let ti = turnScanStart; ti < turnIndices.length; ti++) {
+                        const raw = extractTurnTexts(turnIndices[ti]).join('\n');
+                        if (raw && raw.includes(anchorForSearch)) {
+                            anchorTurnPos = ti;
+                        }
+                    }
+                }
+
+                const scanEnd = turnIndices.length - 1;
+                const scanStart = anchorTurnPos >= 0 ? Math.min(scanEnd, anchorTurnPos + 6) : scanEnd;
+                const scanFloor = anchorTurnPos >= 0 ? anchorTurnPos + 1 : turnScanStart;
+
+                let best = null;
+                for (let ti = scanStart; ti >= scanFloor; ti--) {
+                    const turnTexts = extractTurnTexts(turnIndices[ti]);
+                    const raw = turnTexts.join('\n');
+                    if (!raw) continue;
+
+                    if (expected && raw.includes(expected) && !/Reply\s+with\s+exactly:/i.test(raw)) {
+                        return expected;
+                    }
+
+                    const cleaned = cleanExtractedLines(raw);
+                    if (!cleaned) continue;
+                    if (/Expand to view model thoughts/i.test(cleaned)) continue;
+                    if (turnNoise.some((p) => p.test(cleaned))) continue;
+
+                    if (!best) best = cleaned;
+                }
+
+                if (best) return best;
+
+                const ordered = (() => {
+                    const all = [];
+                    for (const idx of doc.nodes.nodeValue) {
+                        const s = decode(idx);
+                        if (!s) continue;
+                        const t = s.replace(/\s+/g, ' ').trim();
+                        if (!t) continue;
+                        if (t.length > 2000) continue;
+                        if (t.startsWith('{') && t.includes('"') && t.includes(':')) continue;
+                        if (t.includes('function ') || t.includes('var _F_')) continue;
+                        all.push(t);
+                    }
+                    return all;
+                })();
+
+                let anchorIdx = -1;
+                if (anchorForSearch) {
+                    for (let i = ordered.length - 1; i >= 0; i--) {
+                        if (ordered[i].includes(anchorForSearch)) {
+                            anchorIdx = i;
+                            break;
+                        }
+                    }
+                }
+
+                const after = anchorIdx >= 0 ? ordered.slice(anchorIdx + 1) : ordered;
+                const noise = [
+                    /Google AI Studio/i,
+                    /Cookie Consent/i,
+                    /Response ready\.?/i,
+                    /Send prompt \(Ctrl \+ Enter\)/i,
+                    /Enter a prompt/i,
+                    /\b(edit|more_vert|thumb_up|thumb_down|content_copy|download)\b/i,
+                    /Expand to view model thoughts/i,
+                    /'s Confirmation/i,
+                ];
+
+                const candidates = [];
+                for (const t of after) {
+                    if (anchorForSearch && t.includes(anchorForSearch)) continue;
+                    if (noise.some((p) => p.test(t))) continue;
+                    const cleaned = cleanExtractedLines(t);
+                    if (!cleaned) continue;
+                    candidates.push(cleaned);
+                }
+
+                if (candidates.length === 0) return null;
+
+                if (expected) {
+                    for (let i = candidates.length - 1; i >= 0; i--) {
+                        if (candidates[i] && candidates[i].includes(expected)) {
+                            return expected;
+                        }
+                    }
+                }
+
+                return candidates[candidates.length - 1];
+            } catch (e2) {
+                console.log(`⚠️ DOMSnapshot extraction failed: ${e2.message}`);
+                return null;
+            }
+        } catch (e) {
+            console.log(`⚠️ Fallback extraction failed: ${e.message}`);
+            return null;
+        }
+    }
     
     async send(platform, prompt, images) {
         const hasImages = Boolean(images && Array.isArray(images) && images.length > 0);
@@ -634,6 +982,24 @@ class LotlController {
             
             const { page, adapter } = await this.ensureConnection(platform);
             await page.bringToFront();
+
+            // Production guard: detect common AI Studio blockers early.
+            if (platform === 'aistudio') {
+                const blockers = await page.evaluate(() => {
+                    const hay = (document.body && document.body.innerText) ? document.body.innerText : '';
+                    const patterns = [
+                        /Sign in/i,
+                        /Verify it's you/i,
+                        /unusual traffic/i,
+                        /captcha/i,
+                        /Something went wrong/i
+                    ];
+                    return patterns.filter(p => p.test(hay)).map(p => p.toString());
+                });
+                if (Array.isArray(blockers) && blockers.length > 0) {
+                    throw new Error(`AI Studio is blocked (${blockers.join(', ')}). Fix the tab state (login / API key prompt) and retry.`);
+                }
+            }
             
             // Scroll to bottom
             await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
@@ -642,6 +1008,13 @@ class LotlController {
             // Get turn count BEFORE
             const turnsBefore = await adapter.getTurnCount(page);
             console.log(`📊 Turns before: ${turnsBefore}`);
+
+            // Capture the current extracted response so we can detect stale/non-updating extraction.
+            const preSendExtract = platform === 'aistudio'
+                ? String(await adapter.extractResponse(page) || '').trim()
+                : '';
+
+            const expectedExact = platform === 'aistudio' ? parseExpectedExactToken(prompt) : null;
 
             // Upload images if supported by this adapter
             if (images && Array.isArray(images) && images.length > 0) {
@@ -720,9 +1093,72 @@ class LotlController {
             }
             
             // EXTRACT FINAL RESPONSE
-            const response = await adapter.extractResponse(page);
+            let response = await adapter.extractResponse(page);
+            const responseStr = String(response || '').trim();
+            const looksLikeThoughtsOnly = /Expand to view model thoughts/i.test(responseStr) || /^Thoughts\b/i.test(responseStr);
+
+            // If the prompt asks for an exact token, validate we got that token.
+            // This catches cases where the generic "latest model turn" extractor returns a stale/previous reply.
+
+            if (!response || responseStr.length === 0 || (platform === 'aistudio' && looksLikeThoughtsOnly)) {
+                const fallback = await this.extractFallback(platform, page, prompt);
+                if (fallback && fallback.trim().length > 0) {
+                    console.log(`✅ Got response via fallback (${fallback.length} chars)`);
+                    response = fallback;
+                }
+            }
+
+            // If extraction returned a non-empty string that is identical to what we saw before sending,
+            // treat it as likely stale and force fallback.
+            if (platform === 'aistudio') {
+                const gotNow = String(response || '').trim();
+                if (gotNow && preSendExtract && gotNow === preSendExtract) {
+                    console.log('⚠️ Response equals pre-send extraction; forcing fallback extraction');
+                    const fallbackStale = await this.extractFallback(platform, page, prompt);
+                    const fb = String(fallbackStale || '').trim();
+                    if (fb && fb !== gotNow) {
+                        console.log('✅ Stale extraction corrected via fallback');
+                        response = fallbackStale;
+                    }
+                }
+            }
+
+            // Exact-token mode: if we didn't get the expected token, try anchored fallbacks even if response is non-empty.
+            if (platform === 'aistudio' && expectedExact) {
+                const got = String(response || '').trim();
+                if (got !== expectedExact) {
+                    const fallback2 = await this.extractFallback(platform, page, prompt);
+                    const fb = String(fallback2 || '').trim();
+                    if (fb === expectedExact || fb.includes(expectedExact)) {
+                        console.log('✅ Exact-token mode: corrected reply via fallback');
+                        response = expectedExact;
+                    } else {
+                        throw new Error(`Exact-token mode failed. expected="${expectedExact}" got="${got}"`);
+                    }
+                }
+            }
+
+            // If still empty, surface likely blockers rather than returning an empty string.
+            if (platform === 'aistudio' && (!response || String(response).trim().length === 0)) {
+                const hint = await page.evaluate(() => {
+                    const hay = (document.body && document.body.innerText) ? document.body.innerText : '';
+                    const known = [
+                        "Verify it's you",
+                        'Sign in',
+                        'unusual traffic',
+                        'captcha'
+                    ];
+                    for (const k of known) {
+                        if (hay.includes(k)) return k;
+                    }
+                    return null;
+                });
+                if (hint) {
+                    throw new Error(`AI Studio returned an empty reply; likely blocked by: ${hint}. Check the AI Studio tab UI.`);
+                }
+            }
+
             console.log(`✅ Got response (${response ? response.length : 0} chars)`);
-            
             return response;
         }, lockTimeoutMs);
     }
@@ -742,19 +1178,39 @@ class LotlController {
         const { page } = await this.ensureConnection(platform);
         await page.bringToFront();
 
-        // Minimal selector probe
-        const probe = await page.evaluate((selInput, urlPattern) => {
+        // Minimal selector probe + common blocker detection (helps production readiness)
+        const probe = await page.evaluate((selInput, urlPattern, platformName) => {
             const urlOk = window.location.href.includes(urlPattern);
-            const input = document.querySelector(selInput);
+            const isVisible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                if (!style) return false;
+                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                const r = el.getBoundingClientRect();
+                return r && r.width > 10 && r.height > 10;
+            };
+
+            const nodes = Array.from(document.querySelectorAll(selInput));
+            const input = nodes.find(isVisible) || null;
+            const hay = (document.body && document.body.innerText) ? document.body.innerText : '';
+
+            const blockers = [];
+            if (platformName === 'aistudio') {
+                if (/Sign in/i.test(hay)) blockers.push('Sign in');
+                if (/Verify it's you/i.test(hay)) blockers.push("Verify it's you");
+                if (/captcha/i.test(hay) || /unusual traffic/i.test(hay)) blockers.push('Captcha/unusual traffic');
+            }
+
             return {
                 urlOk,
                 hasInput: Boolean(input),
+                blockers,
                 activeUrl: window.location.href
             };
-        }, adapter.selectors.input.split(',')[0], adapter.urlPattern);
+        }, adapter.selectors.input, adapter.urlPattern, platform);
 
         return {
-            ok: Boolean(probe.urlOk && probe.hasInput),
+            ok: Boolean(probe.urlOk && probe.hasInput && (!probe.blockers || probe.blockers.length === 0)),
             chrome: { webSocketDebuggerUrl: version.webSocketDebuggerUrl ? 'present' : 'missing' },
             page: probe,
         };

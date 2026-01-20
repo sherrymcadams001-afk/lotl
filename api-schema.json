@@ -182,8 +182,8 @@
   
   "prerequisites": {
     "chrome": {
-      "command": "chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\temp\\chrome-lotl",
-      "description": "Chrome must be running with remote debugging enabled"
+      "command": "npm run launch-chrome",
+      "description": "Chrome must be running with remote debugging enabled (CDP)"
     },
     "aiStudio": {
       "url": "https://aistudio.google.com",

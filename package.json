@@ -7,10 +7,18 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "start": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& node lotl-controller-v3.js",
-    "start:local": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& set HOST=127.0.0.1&& node lotl-controller-v3.js",
-    "start:lan": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& set HOST=0.0.0.0&& node lotl-controller-v3.js",
-    "launch-chrome": "start chrome.exe --remote-debugging-port=9222 --user-data-dir=C:\\temp\\chrome-lotl"
+    "start": "node scripts/start-controller.js",
+    "start:local": "node scripts/start-controller.js --host 127.0.0.1",
+    "start:lan": "node scripts/start-controller.js --host 0.0.0.0",
+
+    "start:local:win": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& node scripts\\start-controller.js --host 127.0.0.1",
+    "start:lan:win": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& node scripts\\start-controller.js --host 0.0.0.0",
+
+    "launch-chrome": "node scripts/launch-chrome.js --chrome-port 9222",
+    "launch-chrome:win": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& node scripts\\launch-chrome.js --chrome-port 9222",
+
+    "start-instance:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\start-instance.ps1",
+    "start-instance": "bash ./scripts/start-instance.sh"
   },
   "keywords": [
     "puppeteer",

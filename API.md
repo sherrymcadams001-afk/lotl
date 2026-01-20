@@ -5,17 +5,30 @@
 ## Quick Start
 
 ```bash
-# 1. Start Chrome with debugging
-Start-Process "chrome.exe" -ArgumentList "--remote-debugging-port=9222", "--user-data-dir=C:\temp\chrome-lotl"
+# 1. Launch Chrome with remote debugging (cross-platform)
+cd lotl-agent
+npm install
+npm run launch-chrome
+
+# Windows fallback (if `node` isn't on PATH)
+npm run launch-chrome:win
 
 # 2. Open AI Studio in Chrome, log in, start a chat
 
 # 3. Start the controller
-cd lotl-agent
-npm install
 npm run start:local
 
+# Windows fallback (if `node` isn't on PATH)
+npm run start:local:win
+
 # 4. Send requests to http://localhost:3000/aistudio (or legacy /chat)
+```
+
+Multi-instance (Option 1): run another Chrome+controller pair with unique ports:
+
+```bash
+npm run launch-chrome -- --chrome-port 9223 --user-data-dir /tmp/chrome-lotl-9223
+npm run start:local -- --port 3001 --chrome-port 9223
 ```
 
 ---
@@ -301,6 +314,14 @@ Images are uploaded via **Google Drive integration** in AI Studio. The controlle
 
 ### Chrome Launch Command
 
+Recommended (cross-platform):
+
+```bash
+npm run launch-chrome
+```
+
+Manual alternatives:
+
 **Windows:**
 ```powershell
 Start-Process "chrome.exe" -ArgumentList "--remote-debugging-port=9222", "--user-data-dir=C:\temp\chrome-lotl"
@@ -326,7 +347,7 @@ google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-lotl
 | `AI Studio tab not found` | Chrome not open or AI Studio not loaded | Open https://aistudio.google.com in debugging Chrome |
 | `Timeout waiting for response` | AI Studio slow or stuck | Check AI Studio tab, may need new chat session |
 | `Empty response` | Parsing failed | Check AI Studio for errors, restart chat |
-| `Connection refused` | Chrome debugging not enabled | Restart Chrome with `--remote-debugging-port=9222` |
+| `Connection refused` | Chrome debugging not enabled | Restart Chrome with `npm run launch-chrome` (or launch with `--remote-debugging-port=9222`) |
 
 ---
 
