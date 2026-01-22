@@ -39,6 +39,11 @@
         "type": "object",
         "required": ["prompt"],
         "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "Optional session identifier. In LOTL_MODE=multi, each unique sessionId maps to its own dedicated AI Studio tab (enables concurrent sessions). In normal mode it is ignored. In single mode each request is fresh regardless.",
+            "maxLength": 200
+          },
           "prompt": {
             "type": "string",
             "description": "The text prompt to send to the AI model",
@@ -68,6 +73,11 @@
         "type": "object",
         "required": ["prompt"],
         "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "Optional session identifier. In LOTL_MODE=multi, each unique sessionId maps to its own dedicated ChatGPT tab (enables concurrent sessions).",
+            "maxLength": 200
+          },
           "prompt": { "type": "string" }
         }
       }
@@ -80,6 +90,11 @@
         "type": "object",
         "required": ["prompt"],
         "properties": {
+          "sessionId": {
+            "type": "string",
+            "description": "Optional session identifier (see /aistudio and /chatgpt notes).",
+            "maxLength": 200
+          },
           "prompt": {
             "type": "string",
             "description": "The text prompt to send to the AI model",

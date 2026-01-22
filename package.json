@@ -11,6 +11,9 @@
     "start:local": "node scripts/start-controller.js --host 127.0.0.1",
     "start:lan": "node scripts/start-controller.js --host 0.0.0.0",
 
+    "start:single": "node scripts/start-controller.js --mode single",
+    "start:multi": "node scripts/start-controller.js --mode multi",
+
     "start:local:win": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& node scripts\\start-controller.js --host 127.0.0.1",
     "start:lan:win": "set PATH=%PATH%;%ProgramFiles%\\nodejs;%ProgramFiles(x86)%\\nodejs&& node scripts\\start-controller.js --host 0.0.0.0",
 

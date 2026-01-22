@@ -3,6 +3,8 @@ param(
   [int]$ChromePort = 9222,
   [Alias('Host')]
   [string]$BindHost = '127.0.0.1',
+  [ValidateSet('normal','single','multi')]
+  [string]$Mode = 'normal',
   [string]$UserDataDir = '',
   [string]$NodePath = '',
   [string]$ChromePath = '',
@@ -50,8 +52,14 @@ $root = Split-Path -Parent $here
 $node = Resolve-NodePath -Explicit $NodePath
 
 if (-not $UserDataDir -or $UserDataDir.Trim().Length -eq 0) {
-  $UserDataDir = Join-Path ($env:TEMP) ("chrome-lotl-" + $ChromePort)
+  $base = $env:LOCALAPPDATA
+  if (-not $base -or $base.Trim().Length -eq 0) {
+    $base = $env:TEMP
+  }
+  $UserDataDir = Join-Path $base ("LotL\\chrome-lotl-" + $ChromePort)
 }
+
+New-Item -ItemType Directory -Force -Path $UserDataDir | Out-Null
 
 Stop-ListenerOnPort -Port $ControllerPort
 
@@ -65,7 +73,7 @@ Start-Process -FilePath $node -WorkingDirectory $root -ArgumentList $launchArgs 
 # 2) Start controller (detached, with logs)
 $out = Join-Path $root ("controller_${ControllerPort}.out.log")
 $err = Join-Path $root ("controller_${ControllerPort}.err.log")
-$ctrlArgs = @('scripts\start-controller.js','--host',$BindHost,'--port',$ControllerPort,'--chrome-port',$ChromePort)
+$ctrlArgs = @('scripts\start-controller.js','--host',$BindHost,'--port',$ControllerPort,'--chrome-port',$ChromePort,'--mode',$Mode)
 Start-Process -FilePath $node -WorkingDirectory $root -ArgumentList $ctrlArgs -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError $err | Out-Null
 
 $base = "http://${BindHost}:${ControllerPort}"

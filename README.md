@@ -23,26 +23,72 @@ npm install
 
 ## Start
 
+## Modes
+
+The controller supports three modes for clear separation of behaviors:
+
+- **normal** (default): Reuses one existing tab per platform and serializes requests per platform (safest default).
+- **single**: Treats every request as a fresh UI session by creating a new tab, navigating to the platform, executing the request, then closing the tab.
+- **multi**: Supports multiple simultaneous agent sessions inside one controller by using `sessionId` (each unique `sessionId` gets its own dedicated tab and its own lock).
+
+Set the mode via `--mode` or env `LOTL_MODE`.
+
+Optional pacing (slower, less bursty interactions):
+- `ACTION_DELAY_MS` (base delay between key UI actions)
+- `ACTION_DELAY_JITTER_MS` (adds random 0..N ms to the base delay)
+
+Examples:
+
+```powershell
+npm run start:local -- --mode single
+npm run start:local -- --mode multi
+```
+
+Quick API examples (`curl.exe`):
+
+```powershell
+# Normal mode request (default)
+curl.exe -s -X POST "http://127.0.0.1:3000/aistudio" -H "Content-Type: application/json" -d "{\"prompt\":\"Reply with just OK\"}"
+
+# Multi mode (start controller with --mode multi). Each sessionId gets its own dedicated tab.
+curl.exe -s -X POST "http://127.0.0.1:3000/aistudio" -H "Content-Type: application/json" -d "{\"prompt\":\"Reply with just: A\",\"sessionId\":\"agent-1\"}"
+curl.exe -s -X POST "http://127.0.0.1:3000/aistudio" -H "Content-Type: application/json" -d "{\"prompt\":\"Reply with just: B\",\"sessionId\":\"agent-2\"}"
+```
+
+In **multi** mode, run the two `agent-1` / `agent-2` calls from two terminals (or background jobs) to validate simultaneous agent sessions.
+
+Note: for large-scale multi-agent isolation across profiles, Option 1 (multiple Chrome + multiple controllers) is still the most robust.
+
 ### Recommended: start an isolated instance (one command)
 
 This starts **both** Chrome (with CDP) and the controller, writes logs to files, and waits for `/ready`.
 
+Important: login is stored in Chrome’s `--user-data-dir`.
+- On the first run for a given `ChromePort`/`USER_DATA_DIR`, you may need to open the launched Chrome window and sign in to AI Studio.
+- After that, reuse the same `USER_DATA_DIR` and the controller will stay logged in (including **single** mode, since it reuses the same Chrome profile and only opens/closes tabs).
+
 Windows:
 
 ```powershell
-./scripts/start-instance.ps1 -ControllerPort 3000 -ChromePort 9222
+./scripts/start-instance.ps1 -ControllerPort 3000 -ChromePort 9222 -Mode normal
+```
+
+To force a specific persistent profile directory:
+
+```powershell
+./scripts/start-instance.ps1 -ControllerPort 3000 -ChromePort 9222 -Mode single -UserDataDir "$env:LOCALAPPDATA\LotL\chrome-lotl-9222"
 ```
 
 Or via npm:
 
 ```powershell
-npm run start-instance:win -- -ControllerPort 3000 -ChromePort 9222
+npm run start-instance:win -- -ControllerPort 3000 -ChromePort 9222 -Mode normal
 ```
 
 If Chrome or Node aren’t on PATH, pass explicit paths:
 
 ```powershell
-./scripts/start-instance.ps1 -ControllerPort 3000 -ChromePort 9222 -NodePath "C:\Program Files\nodejs\node.exe" -ChromePath "C:\Program Files\Google\Chrome\Application\chrome.exe"
+./scripts/start-instance.ps1 -ControllerPort 3000 -ChromePort 9222 -Mode normal -NodePath "C:\Program Files\nodejs\node.exe" -ChromePath "C:\Program Files\Google\Chrome\Application\chrome.exe"
 ```
 
 macOS / Linux:
@@ -50,6 +96,12 @@ macOS / Linux:
 ```bash
 chmod +x scripts/start-instance.sh
 ./scripts/start-instance.sh 3000 9222
+```
+
+To force a specific persistent profile directory:
+
+```bash
+USER_DATA_DIR="$HOME/.lotl/chrome-lotl-9222" MODE=single ./scripts/start-instance.sh 3000 9222
 ```
 
 Or via npm (requires `bash`):
@@ -62,6 +114,7 @@ Environment overrides:
 - `USER_DATA_DIR` (Chrome profile dir)
 - `WAIT_READY_SEC` (default `180`)
 - `CHROME_PATH` (Linux, or direct binary override)
+- `MODE` (controller mode: `normal|single|multi`)
 
 ---
 

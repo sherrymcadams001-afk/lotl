@@ -46,15 +46,24 @@ if (!Number.isFinite(chromePort) || chromePort <= 0) {
 
 const defaultUserDataDir = (() => {
     if (process.platform === 'win32') {
-        // Prefer TEMP to avoid permissions issues.
-        const base = process.env.TEMP || 'C:\\temp';
-        return path.join(base, `chrome-lotl-${chromePort}`);
+        // Prefer a persistent dir so users stay logged in between runs.
+        // Fallback to TEMP if LOCALAPPDATA is unavailable.
+        const base = process.env.LOCALAPPDATA || process.env.TEMP || 'C:\\temp';
+        return path.join(base, 'LotL', `chrome-lotl-${chromePort}`);
     }
-    return path.join(os.tmpdir(), `chrome-lotl-${chromePort}`);
+    // Prefer a persistent dir so users stay logged in between runs.
+    const home = process.env.HOME || os.homedir() || os.tmpdir();
+    return path.join(home, '.lotl', `chrome-lotl-${chromePort}`);
 })();
 
 const userDataDir = String(args['user-data-dir'] || defaultUserDataDir);
 const chromeArgs = [`--remote-debugging-port=${chromePort}`, `--user-data-dir=${userDataDir}`];
+
+try {
+    fs.mkdirSync(userDataDir, { recursive: true });
+} catch {
+    // If mkdir fails (permissions), Chrome will surface the error; we keep going.
+}
 
 function resolveChromePath() {
     const argPath = args['chrome-path'] ? String(args['chrome-path']) : null;

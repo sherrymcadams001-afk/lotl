@@ -53,6 +53,23 @@ const PUPPETEER_PROTOCOL_TIMEOUT_MS = Number(process.env.PUPPETEER_PROTOCOL_TIME
 const LOCK_TIMEOUT_MS_TEXT = Number(process.env.LOCK_TIMEOUT_MS_TEXT || 420000);
 const LOCK_TIMEOUT_MS_IMAGES = Number(process.env.LOCK_TIMEOUT_MS_IMAGES || 900000);
 
+// Optional pacing to avoid rapid, machine-like sequences (opt-in).
+const ACTION_DELAY_MS = Number(process.env.ACTION_DELAY_MS || 0);
+const ACTION_DELAY_JITTER_MS = Number(process.env.ACTION_DELAY_JITTER_MS || 0);
+
+// Controller operation mode:
+// - normal: reuse one existing tab per platform (default)
+// - single: each request uses a fresh tab (open -> run -> close)
+// - multi: sessionId-aware tabs (concurrent sessions)
+const LOTL_MODE = String(process.env.LOTL_MODE || 'normal').toLowerCase();
+const MULTI_MAX_SESSIONS = Number(process.env.MULTI_MAX_SESSIONS || 8);
+
+const VALID_MODES = new Set(['normal', 'single', 'multi']);
+if (!VALID_MODES.has(LOTL_MODE)) {
+    console.error(`❌ Invalid LOTL_MODE="${LOTL_MODE}". Expected one of: normal | single | multi`);
+    process.exit(1);
+}
+
 function nowIso() {
     return new Date().toISOString();
 }
@@ -63,6 +80,15 @@ function newRequestId() {
 
 function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
+}
+
+async function humanPause() {
+    const base = Number.isFinite(ACTION_DELAY_MS) ? ACTION_DELAY_MS : 0;
+    const jitter = Number.isFinite(ACTION_DELAY_JITTER_MS) ? ACTION_DELAY_JITTER_MS : 0;
+    if (base <= 0 && jitter <= 0) return;
+    const extra = jitter > 0 ? Math.floor(Math.random() * jitter) : 0;
+    const delay = Math.max(0, base + extra);
+    if (delay > 0) await sleep(delay);
 }
 
 function withTimeout(promise, ms, timeoutMessage) {
@@ -159,6 +185,8 @@ const ADAPTERS = {
     aistudio: {
         name: 'AI Studio (Gemini)',
         urlPattern: 'aistudio.google.com',
+        // Use a direct chat URL; the homepage often doesn't render a prompt box.
+        launchUrl: 'https://aistudio.google.com/app/prompts/new_chat',
         selectors: {
             input: 'footer textarea, textarea, div[contenteditable="true"]',
             runButton: 'button[aria-label*="Run"], button[aria-label*="Send"], button[aria-label*="Submit"]',
@@ -539,6 +567,7 @@ const ADAPTERS = {
     chatgpt: {
         name: 'ChatGPT',
         urlPattern: 'chatgpt.com',
+        launchUrl: 'https://chatgpt.com',
         selectors: {
             input: '#prompt-textarea, textarea[data-id="root"], div[contenteditable="true"][data-placeholder]',
             sendButton: 'button[data-testid="send-button"], button[aria-label*="Send"]',
@@ -663,90 +692,188 @@ const ADAPTERS = {
 
 // ========== CONTROLLER CLASS ==========
 class LotlController {
-    constructor() {
+    constructor(opts = {}) {
+        this.mode = String(opts.mode || LOTL_MODE).toLowerCase();
         this.browser = null;
-        this.pages = {};  // Separate page references per platform
-        this._locks = {
-            aistudio: Promise.resolve(),
-            chatgpt: Promise.resolve(),
-        };
+        // `${platform}:${sessionId}` -> { page, createdAt, lastUsedAt }
+        this._pageCache = new Map();
+        // lockKey -> Promise chain
+        this._locks = new Map();
+        // In single mode, we should never accumulate tabs even if a prior request died mid-flight.
+        // Track last ephemeral per platform and forcibly close it before starting a new request.
+        this._singleEphemeralByPlatform = new Map();
         this._connectLock = Promise.resolve();
     }
-    
-    async connect(platform) {
-        const adapter = ADAPTERS[platform];
-        if (!adapter) throw new Error(`Unknown platform: ${platform}`);
-        
-        console.log(`🔌 Connecting to ${adapter.name}...`);
-        
-        // Get browser connection (serialized)
-        if (!this.browser) {
-            this._connectLock = this._connectLock.then(async () => {
-                if (this.browser) return;
-                const versionData = await fetchJsonWithTimeout(
-                    `http://127.0.0.1:${CHROME_DEBUG_PORT}/json/version`,
-                    CONNECT_TIMEOUT_MS
-                );
 
-                this.browser = await puppeteer.connect({
-                    browserWSEndpoint: versionData.webSocketDebuggerUrl,
-                    defaultViewport: null,
-                    protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS
-                });
-                this.browser.on('disconnected', () => {
-                    console.error('⚠️ Chrome disconnected; clearing cached pages/browser');
-                    this.browser = null;
-                    this.pages = {};
-                });
+    _normalizeSessionId(sessionId) {
+        const s = String(sessionId || '').trim();
+        return s.length > 0 ? s.slice(0, 200) : 'default';
+    }
 
-                console.log('✅ Connected to Chrome');
+    _cacheKey(platform, sessionId) {
+        return `${platform}:${this._normalizeSessionId(sessionId)}`;
+    }
+
+    _lockKey(platform, sessionId) {
+        if (this.mode === 'multi') return this._cacheKey(platform, sessionId);
+        return platform;
+    }
+
+    async _ensureBrowserConnected() {
+        if (this.browser) return;
+
+        this._connectLock = this._connectLock.then(async () => {
+            if (this.browser) return;
+
+            const versionData = await fetchJsonWithTimeout(
+                `http://127.0.0.1:${CHROME_DEBUG_PORT}/json/version`,
+                CONNECT_TIMEOUT_MS
+            );
+
+            this.browser = await puppeteer.connect({
+                browserWSEndpoint: versionData.webSocketDebuggerUrl,
+                defaultViewport: null,
+                protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS
+            });
+            this.browser.on('disconnected', () => {
+                console.error('⚠️ Chrome disconnected; clearing cached pages/browser');
+                this.browser = null;
+                this._pageCache.clear();
+                this._locks.clear();
+                this._singleEphemeralByPlatform.clear();
             });
 
-            await this._connectLock;
+            console.log('✅ Connected to Chrome');
+        });
+
+        await this._connectLock;
+    }
+
+    async _ensurePageHealthy(page) {
+        if (!page) return false;
+        try {
+            await page.title();
+            return true;
+        } catch {
+            return false;
         }
-        
+    }
+
+    async _waitForUsableInput(platform, page) {
+        const adapter = ADAPTERS[platform];
+        if (!adapter) return;
+        await page.waitForSelector(adapter.selectors.input, { timeout: 20000 });
+    }
+
+    async _createFreshPage(platform) {
+        const adapter = ADAPTERS[platform];
+        if (!adapter) throw new Error(`Unknown platform: ${platform}`);
+        await this._ensureBrowserConnected();
+
+        const page = await this.browser.newPage();
+        const url = adapter.launchUrl || `https://${adapter.urlPattern}`;
+        await page.goto(url, { waitUntil: 'domcontentloaded' });
+        await this._waitForUsableInput(platform, page);
+        return { page, adapter, ephemeral: true };
+    }
+
+    async _connectExistingTab(platform) {
+        const adapter = ADAPTERS[platform];
+        if (!adapter) throw new Error(`Unknown platform: ${platform}`);
+
+        console.log(`🔌 Connecting to ${adapter.name}...`);
+
+        await this._ensureBrowserConnected();
+
         // Find the right tab
         const targets = await this.browser.targets();
-        const target = targets.find(t => 
+        const target = targets.find(t =>
             t.url().includes(adapter.urlPattern) && t.type() === 'page'
         );
-        
+
         if (!target) {
             throw new Error(
                 `${adapter.name} tab not found. Open ${adapter.urlPattern} in Chrome first.`
             );
         }
-        
+
         const page = await target.page();
         if (!page) throw new Error(`Could not get page for ${adapter.name}`);
-        
-        this.pages[platform] = page;
+
         console.log(`✅ Connected to ${adapter.name}`);
-        return { page, adapter };
+        return { page, adapter, ephemeral: false };
     }
-    
-    async ensureConnection(platform) {
-        if (this.pages[platform]) {
-            try {
-                await this.pages[platform].title();  // Quick health check
-                return { page: this.pages[platform], adapter: ADAPTERS[platform] };
-            } catch (e) {
-                console.log(`⚠️ Connection stale, reconnecting...`);
-                delete this.pages[platform];
-            }
+
+    async ensureConnection(platform, sessionId, opts = {}) {
+        const sid = this._normalizeSessionId(sessionId);
+        const adapter = ADAPTERS[platform];
+        if (!adapter) throw new Error(`Unknown platform: ${platform}`);
+
+        const forceFresh = Boolean(opts.fresh);
+
+        if (this.mode === 'single' || forceFresh) {
+            return await this._createFreshPage(platform);
         }
-        return await this.connect(platform);
+
+        if (this.mode === 'multi') {
+            const key = this._cacheKey(platform, sid);
+            const cached = this._pageCache.get(key);
+            if (cached && cached.page && await this._ensurePageHealthy(cached.page)) {
+                cached.lastUsedAt = Date.now();
+                return { page: cached.page, adapter, ephemeral: false };
+            }
+
+            await this._ensureBrowserConnected();
+            const page = await this.browser.newPage();
+            const url = adapter.launchUrl || `https://${adapter.urlPattern}`;
+            await page.goto(url, { waitUntil: 'domcontentloaded' });
+            await this._waitForUsableInput(platform, page);
+
+            // Enforce a simple per-platform cap.
+            const platformKeys = Array.from(this._pageCache.keys()).filter(k => k.startsWith(`${platform}:`));
+            if (platformKeys.length >= MULTI_MAX_SESSIONS) {
+                let oldestKey = null;
+                let oldestAt = Infinity;
+                for (const k of platformKeys) {
+                    const v = this._pageCache.get(k);
+                    const t = (v && v.lastUsedAt) ? v.lastUsedAt : 0;
+                    if (t < oldestAt) { oldestAt = t; oldestKey = k; }
+                }
+                if (oldestKey) {
+                    const victim = this._pageCache.get(oldestKey);
+                    this._pageCache.delete(oldestKey);
+                    if (victim && victim.page) {
+                        await victim.page.close({ runBeforeUnload: false }).catch(() => undefined);
+                    }
+                }
+            }
+
+            this._pageCache.set(key, { page, createdAt: Date.now(), lastUsedAt: Date.now() });
+            return { page, adapter, ephemeral: false };
+        }
+
+        // normal mode
+        const key = this._cacheKey(platform, 'default');
+        const cached = this._pageCache.get(key);
+        if (cached && cached.page && await this._ensurePageHealthy(cached.page)) {
+            cached.lastUsedAt = Date.now();
+            return { page: cached.page, adapter, ephemeral: false };
+        }
+
+        const connected = await this._connectExistingTab(platform);
+        this._pageCache.set(key, { page: connected.page, createdAt: Date.now(), lastUsedAt: Date.now() });
+        return connected;
     }
-    
-    async withLock(platform, fn, timeoutMs) {
+
+    async withLock(lockKey, fn, timeoutMs) {
         const ms = Number(timeoutMs || LOCK_TIMEOUT_MS_TEXT);
         const timeout = new Promise((_, reject) =>
             setTimeout(() => reject(new Error(`Lock timeout (${Math.round(ms / 1000)}s)`)), ms)
         );
 
-        const prior = this._locks[platform] || Promise.resolve();
+        const prior = this._locks.get(lockKey) || Promise.resolve();
         const run = prior.then(fn, fn);
-        this._locks[platform] = run.catch(() => undefined);
+        this._locks.set(lockKey, run.catch(() => undefined));
         return Promise.race([run, timeout]);
     }
 
@@ -973,15 +1100,34 @@ class LotlController {
         }
     }
     
-    async send(platform, prompt, images) {
+    async send(platform, prompt, images, opts = {}) {
         const hasImages = Boolean(images && Array.isArray(images) && images.length > 0);
         const lockTimeoutMs = platform === 'aistudio' && hasImages ? LOCK_TIMEOUT_MS_IMAGES : LOCK_TIMEOUT_MS_TEXT;
 
-        return await this.withLock(platform, async () => {
+        const sessionId = this._normalizeSessionId(opts.sessionId);
+        const lockKey = this._lockKey(platform, sessionId);
+
+        return await this.withLock(lockKey, async () => {
             console.log(`\n📩 [${platform.toUpperCase()}] Processing prompt (${prompt.length} chars)...`);
-            
-            const { page, adapter } = await this.ensureConnection(platform);
-            await page.bringToFront();
+
+            let conn;
+            try {
+                if (this.mode === 'single') {
+                    const prev = this._singleEphemeralByPlatform.get(platform);
+                    if (prev && await this._ensurePageHealthy(prev)) {
+                        await prev.close({ runBeforeUnload: false }).catch(() => undefined);
+                    }
+                    this._singleEphemeralByPlatform.delete(platform);
+                }
+
+                conn = await this.ensureConnection(platform, sessionId);
+                const { page, adapter } = conn;
+
+                if (this.mode === 'single' && conn.ephemeral) {
+                    this._singleEphemeralByPlatform.set(platform, page);
+                }
+                await page.bringToFront();
+                await humanPause();
 
             // Production guard: detect common AI Studio blockers early.
             if (platform === 'aistudio') {
@@ -1024,6 +1170,7 @@ class LotlController {
                     console.log(`📷 Images provided (${images.length}) but adapter does not support uploads; ignoring`);
                 }
             }
+                await humanPause();
             
             // SET INPUT via DOM
             console.log(`⌨️ Setting input via DOM...`);
@@ -1032,6 +1179,7 @@ class LotlController {
                 throw new Error('Failed to set input - selector not found');
             }
             await sleep(300);
+                await humanPause();
             
             // CLICK RUN via DOM
             console.log(`🚀 Clicking run/send...`);
@@ -1158,8 +1306,20 @@ class LotlController {
                 }
             }
 
-            console.log(`✅ Got response (${response ? response.length : 0} chars)`);
-            return response;
+                console.log(`✅ Got response (${response ? response.length : 0} chars)`);
+                return response;
+            } finally {
+                if (conn && conn.ephemeral && conn.page) {
+                    await conn.page.close({ runBeforeUnload: false }).catch(() => undefined);
+                }
+
+                if (this.mode === 'single') {
+                    const last = this._singleEphemeralByPlatform.get(platform);
+                    if (last && conn && last === conn.page) {
+                        this._singleEphemeralByPlatform.delete(platform);
+                    }
+                }
+            }
         }, lockTimeoutMs);
     }
 
@@ -1175,7 +1335,9 @@ class LotlController {
             READY_TIMEOUT_MS
         );
 
-        const { page } = await this.ensureConnection(platform);
+        const forceFresh = this.mode === 'single' || this.mode === 'multi';
+        const conn = await this.ensureConnection(platform, '__probe__', { fresh: forceFresh });
+        const { page } = conn;
         await page.bringToFront();
 
         // Minimal selector probe + common blocker detection (helps production readiness)
@@ -1209,11 +1371,17 @@ class LotlController {
             };
         }, adapter.selectors.input, adapter.urlPattern, platform);
 
-        return {
+        const result = {
             ok: Boolean(probe.urlOk && probe.hasInput && (!probe.blockers || probe.blockers.length === 0)),
             chrome: { webSocketDebuggerUrl: version.webSocketDebuggerUrl ? 'present' : 'missing' },
             page: probe,
         };
+
+        if (conn && conn.ephemeral && conn.page) {
+            await conn.page.close({ runBeforeUnload: false }).catch(() => undefined);
+        }
+
+        return result;
     }
 }
 
@@ -1228,6 +1396,8 @@ app.get('/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         version: 'v3-solidified',
+        mode: controller.mode,
+        multiMaxSessions: MULTI_MAX_SESSIONS,
         endpoints: ['/aistudio', '/chatgpt', '/chat'],
         timestamp: nowIso()
     });
@@ -1262,7 +1432,7 @@ app.get('/ready', async (req, res) => {
 
 // ---------- AI STUDIO ENDPOINT ----------
 app.post('/aistudio', async (req, res) => {
-    const { prompt, images } = req.body;
+    const { prompt, images, sessionId } = req.body;
     const requestId = newRequestId();
     
     if (!prompt) {
@@ -1279,7 +1449,7 @@ app.post('/aistudio', async (req, res) => {
     console.log(`\n🔵 [AISTUDIO] Request: "${prompt.substring(0, 60)}..."`);
     
     try {
-        const reply = await controller.send('aistudio', prompt, images);
+        const reply = await controller.send('aistudio', prompt, images, { sessionId });
         res.json({ 
             success: true, 
             reply,
@@ -1301,7 +1471,7 @@ app.post('/aistudio', async (req, res) => {
 
 // ---------- CHATGPT ENDPOINT ----------
 app.post('/chatgpt', async (req, res) => {
-    const { prompt, images } = req.body;
+    const { prompt, images, sessionId } = req.body;
     const requestId = newRequestId();
         if (images && Array.isArray(images) && images.length > 0) {
             return res.status(400).json({
@@ -1324,7 +1494,7 @@ app.post('/chatgpt', async (req, res) => {
     console.log(`\n🟢 [CHATGPT] Request: "${prompt.substring(0, 60)}..."`);
     
     try {
-        const reply = await controller.send('chatgpt', prompt);
+        const reply = await controller.send('chatgpt', prompt, undefined, { sessionId });
         res.json({ 
             success: true, 
             reply,
@@ -1345,7 +1515,7 @@ app.post('/chatgpt', async (req, res) => {
 
 // ---------- LEGACY UNIFIED ENDPOINT ----------
 app.post('/chat', async (req, res) => {
-    const { prompt, target = 'gemini', images } = req.body;
+    const { prompt, target = 'gemini', images, sessionId } = req.body;
     const requestId = newRequestId();
     
     if (!prompt) {
@@ -1368,7 +1538,7 @@ app.post('/chat', async (req, res) => {
     console.log(`\n⚪ [CHAT] Request (target: ${target} -> ${platform})`);
     
     try {
-        const reply = await controller.send(platform, prompt, images);
+        const reply = await controller.send(platform, prompt, images, { sessionId });
         res.json({ 
             success: true, 
             status: 'success',  // Legacy compat
@@ -1391,7 +1561,11 @@ app.post('/chat', async (req, res) => {
 // ---------- CONNECTION TEST ENDPOINTS ----------
 app.get('/test/aistudio', async (req, res) => {
     try {
-        await controller.ensureConnection('aistudio');
+        const forceFresh = controller.mode === 'single' || controller.mode === 'multi';
+        const conn = await controller.ensureConnection('aistudio', '__test__', { fresh: forceFresh });
+        if (conn && conn.ephemeral && conn.page) {
+            await conn.page.close({ runBeforeUnload: false }).catch(() => undefined);
+        }
         res.json({ 
             success: true, 
             message: 'AI Studio connection OK',
@@ -1408,7 +1582,11 @@ app.get('/test/aistudio', async (req, res) => {
 
 app.get('/test/chatgpt', async (req, res) => {
     try {
-        await controller.ensureConnection('chatgpt');
+        const forceFresh = controller.mode === 'single' || controller.mode === 'multi';
+        const conn = await controller.ensureConnection('chatgpt', '__test__', { fresh: forceFresh });
+        if (conn && conn.ephemeral && conn.page) {
+            await conn.page.close({ runBeforeUnload: false }).catch(() => undefined);
+        }
         res.json({ 
             success: true, 
             message: 'ChatGPT connection OK',
@@ -1441,6 +1619,7 @@ const server = app.listen(PORT, HOST, () => {
     console.log('🤖 LOTL CONTROLLER v3 - SOLIDIFIED');
     console.log('═'.repeat(60));
     console.log(`🌐 Listening on http://${HOST}:${PORT}`);
+    console.log(`⚙️  Mode: ${controller.mode}`);
     console.log('');
     console.log('📋 ENDPOINTS:');
     console.log('   POST /aistudio    - AI Studio (Gemini) - DEDICATED');

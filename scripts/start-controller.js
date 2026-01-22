@@ -27,7 +27,7 @@ function parseArgs(argv) {
 
 function printHelp() {
     // Keep output compact; users can read README for full examples.
-    console.log(`LotL Controller starter\n\nUsage:\n  node scripts/start-controller.js [--host 127.0.0.1] [--port 3000] [--chrome-port 9222]\n\nOptions:\n  --host         Bind address (default: controller default)\n  --port         HTTP port (default: controller default)\n  --chrome-port  Chrome remote debugging port (default: controller default)\n`);
+    console.log(`LotL Controller starter\n\nUsage:\n  node scripts/start-controller.js [--host 127.0.0.1] [--port 3000] [--chrome-port 9222] [--mode normal]\n\nOptions:\n  --host         Bind address (default: controller default)\n  --port         HTTP port (default: controller default)\n  --chrome-port  Chrome remote debugging port (default: controller default)\n  --mode         Controller mode: normal | single | multi (default: normal)\n`);
 }
 
 const args = parseArgs(process.argv.slice(2));
@@ -39,6 +39,7 @@ if (args.help) {
 if (args.host) process.env.HOST = String(args.host);
 if (args.port) process.env.PORT = String(args.port);
 if (args['chrome-port']) process.env.CHROME_PORT = String(args['chrome-port']);
+if (args.mode) process.env.LOTL_MODE = String(args.mode);
 
 // Load the controller in-process so we don't rely on shell-specific scripts.
 require(path.join(__dirname, '..', 'lotl-controller-v3.js'));
