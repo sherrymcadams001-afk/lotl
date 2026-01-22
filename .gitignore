@@ -50,6 +50,15 @@ debug-*.png
 debug-*.html
 ai-studio-*.png
 
+# Local test artifacts
+chatgpt_single_*.jsonl
+chatgpt_single_*_summary.json
+single_mode_*.txt
+aistudio_capture.png
+
+# Local entrypoint copies
+lotl-controller.js
+
 # Temp files
 *.tmp
 *.temp
