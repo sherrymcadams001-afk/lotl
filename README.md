@@ -32,23 +32,27 @@ npm install
 
 ### 2. Launch Chrome with Remote Debugging
 
+> **Important**: Use a persistent `--user-data-dir` so your login stays saved. One Google login covers both AI Studio AND Gemini.
+
 ```powershell
-# Windows
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:LOCALAPPDATA\LotL\chrome-lotl-9222"
+# Windows (persistent profile in AppData)
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:LOCALAPPDATA\LotL\chrome-lotl"
 
 # macOS
-open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-lotl-9222
+open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir="$HOME/.lotl/chrome-profile"
 
 # Linux
-google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-lotl-9222
+google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.lotl/chrome-profile"
 ```
 
-### 3. Open AI Tabs & Login
+### 3. Login Once (First Time Only)
 
-In the launched Chrome window, open and login to:
-- https://gemini.google.com (for `/gemini`)
-- https://aistudio.google.com (for `/aistudio`)
-- https://chatgpt.com (for `/chatgpt`)
+In the launched Chrome:
+1. Go to **https://aistudio.google.com** and sign in with your Google account
+2. That's it! Your Google login now works for both `/aistudio` AND `/gemini` endpoints
+3. (Optional) For ChatGPT: go to https://chatgpt.com and login separately
+
+> **Tip**: Keep these tabs open. The controller finds them automatically.
 
 ### 4. Start the Controller
 
@@ -247,12 +251,12 @@ node lotl-controller-v3.js
 
 ## Multiple Instances
 
-Run separate Chrome profiles + controllers for complete isolation:
+Run separate Chrome profiles + controllers for complete isolation (e.g., different Google accounts):
 
 ### Instance A (Port 3000, Chrome 9222)
 
 ```powershell
-# Terminal 1: Chrome
+# Terminal 1: Chrome (login to Google account A once, stays logged in)
 & chrome.exe --remote-debugging-port=9222 --user-data-dir="$env:LOCALAPPDATA\LotL\chrome-9222"
 
 # Terminal 2: Controller
@@ -263,13 +267,15 @@ node lotl-controller-v3.js
 ### Instance B (Port 3001, Chrome 9223)
 
 ```powershell
-# Terminal 3: Chrome
+# Terminal 3: Chrome (login to Google account B once, stays logged in)
 & chrome.exe --remote-debugging-port=9223 --user-data-dir="$env:LOCALAPPDATA\LotL\chrome-9223"
 
 # Terminal 4: Controller
 $env:PORT = "3001"; $env:CHROME_PORT = "9223"
 node lotl-controller-v3.js
 ```
+
+> **Note**: Each Chrome profile stores its own Google login. Login once per profile, and it persists across restarts.
 
 ---
 
