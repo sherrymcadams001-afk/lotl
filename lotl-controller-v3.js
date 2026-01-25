@@ -9,6 +9,7 @@
 const puppeteer = require('puppeteer-core');
 const express = require('express');
 const bodyParser = require('body-parser');
+const { spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -42,8 +43,9 @@ assertRuntimeRequirements();
 
 // ========== CONFIGURATION ==========
 const PORT = Number(process.env.PORT || 3000);
-// Safer default: local-only. Opt into LAN via HOST=0.0.0.0
-const HOST = process.env.HOST || '127.0.0.1';
+// Default to 0.0.0.0 to allow remote API access (agents on other machines).
+// Set HOST=127.0.0.1 to restrict to local-only if needed.
+const HOST = process.env.HOST || '0.0.0.0';
 const CHROME_DEBUG_PORT = Number(process.env.CHROME_PORT || 9222);
 const READY_TIMEOUT_MS = Number(process.env.READY_TIMEOUT_MS || 5000);
 const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 8000);
@@ -58,15 +60,22 @@ const ACTION_DELAY_MS = Number(process.env.ACTION_DELAY_MS || 0);
 const ACTION_DELAY_JITTER_MS = Number(process.env.ACTION_DELAY_JITTER_MS || 0);
 
 // Controller operation mode:
-// - normal: reuse one existing tab per platform (default)
+// - normal: reuse one existing tab per platform (legacy default)
+// - api: like normal, but aims to behave like an API by starting a new chat each request
+//        using native keyboard shortcuts (where available)
 // - single: each request uses a fresh tab (open -> run -> close)
 // - multi: sessionId-aware tabs (concurrent sessions)
-const LOTL_MODE = String(process.env.LOTL_MODE || 'normal').toLowerCase();
+const LOTL_MODE = String(process.env.LOTL_MODE || 'api').toLowerCase();
 const MULTI_MAX_SESSIONS = Number(process.env.MULTI_MAX_SESSIONS || 8);
 
-const VALID_MODES = new Set(['normal', 'single', 'multi']);
+// Single-mode safety: hard-cap ephemeral tabs so a crash/timeout doesn't accumulate hundreds of tabs.
+// Defaults are conservative; tune via env if desired.
+const SINGLE_MAX_EPHEMERAL_PER_PLATFORM = Number(process.env.SINGLE_MAX_EPHEMERAL_PER_PLATFORM || 1);
+const SINGLE_MAX_EPHEMERAL_TOTAL = Number(process.env.SINGLE_MAX_EPHEMERAL_TOTAL || 4);
+
+const VALID_MODES = new Set(['normal', 'api', 'single', 'multi']);
 if (!VALID_MODES.has(LOTL_MODE)) {
-    console.error(`❌ Invalid LOTL_MODE="${LOTL_MODE}". Expected one of: normal | single | multi`);
+    console.error(`❌ Invalid LOTL_MODE="${LOTL_MODE}". Expected one of: normal | api | single | multi`);
     process.exit(1);
 }
 
@@ -80,6 +89,112 @@ function newRequestId() {
 
 function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
+}
+
+function _primaryModifierKey() {
+    return process.platform === 'darwin' ? 'Meta' : 'Control';
+}
+
+async function _pressWithPrimary(page, primaryKey, { shift, key }) {
+    try {
+        await page.bringToFront().catch(() => undefined);
+        await page.keyboard.down(primaryKey);
+        if (shift) await page.keyboard.down('Shift');
+        await page.keyboard.press(key);
+        return true;
+    } catch {
+        return false;
+    } finally {
+        if (shift) await page.keyboard.up('Shift').catch(() => undefined);
+        await page.keyboard.up(primaryKey).catch(() => undefined);
+    }
+}
+
+async function pressComboRdpSafe(page, combo) {
+    // In RDP scenarios (macOS client -> Windows host), the user's Cmd key may map unexpectedly.
+    // To be resilient, try both Control and Meta as the "primary" modifier.
+    if (!combo || !combo.primary) {
+        return await pressCombo(page, combo);
+    }
+    const attempts = ['Control', 'Meta'];
+    for (const primaryKey of attempts) {
+        const ok = await _pressWithPrimary(page, primaryKey, { shift: Boolean(combo.shift), key: combo.key });
+        if (ok) return true;
+        await sleep(40);
+    }
+    return false;
+}
+
+async function pressCombo(page, combo) {
+    // combo example: { primary: true, shift: true, key: 'KeyO' }
+    const primary = _primaryModifierKey();
+    try {
+        await page.bringToFront().catch(() => undefined);
+        if (combo.primary) await page.keyboard.down(primary);
+        if (combo.shift) await page.keyboard.down('Shift');
+        await page.keyboard.press(combo.key);
+    } finally {
+        if (combo.shift) await page.keyboard.up('Shift').catch(() => undefined);
+        if (combo.primary) await page.keyboard.up(primary).catch(() => undefined);
+    }
+}
+
+function getClipboardText() {
+    try {
+        if (process.platform === 'win32') {
+            const r = spawnSync('powershell.exe', ['-NoProfile', '-Command', 'Get-Clipboard -Raw'], { encoding: 'utf8' });
+            return (r.stdout || '').toString();
+        }
+        if (process.platform === 'darwin') {
+            const r = spawnSync('pbpaste', [], { encoding: 'utf8' });
+            return (r.stdout || '').toString();
+        }
+    } catch {
+        // ignore
+    }
+    return '';
+}
+
+function setClipboardText(text) {
+    const s = String(text ?? '');
+    try {
+        if (process.platform === 'win32') {
+            spawnSync('powershell.exe', ['-NoProfile', '-Command', 'Set-Clipboard -Value ([Console]::In.ReadToEnd())'], {
+                input: s,
+                encoding: 'utf8'
+            });
+            return;
+        }
+        if (process.platform === 'darwin') {
+            spawnSync('pbcopy', [], { input: s, encoding: 'utf8' });
+            return;
+        }
+    } catch {
+        // ignore
+    }
+}
+
+async function setClipboardTextVerified(text, opts = {}) {
+    const retries = Number.isFinite(opts.retries) ? opts.retries : 4;
+    const delayMs = Number.isFinite(opts.delayMs) ? opts.delayMs : 60;
+    const want = String(text ?? '');
+    for (let i = 0; i < retries; i++) {
+        setClipboardText(want);
+        await sleep(delayMs);
+        const got = getClipboardText();
+        if (String(got ?? '') === want) return true;
+    }
+    return false;
+}
+
+async function withClipboardRestored(fn) {
+    const prior = getClipboardText();
+    try {
+        return await fn();
+    } finally {
+        // Best-effort restore so we don't trash the user's clipboard.
+        setClipboardText(prior);
+    }
 }
 
 async function humanPause() {
@@ -187,6 +302,15 @@ const ADAPTERS = {
         urlPattern: 'aistudio.google.com',
         // Use a direct chat URL; the homepage often doesn't render a prompt box.
         launchUrl: 'https://aistudio.google.com/app/prompts/new_chat',
+        clickNewChat: async (page) => {
+            // AI Studio: navigating directly to the new_chat route is the most reliable "new chat" action.
+            try {
+                await page.goto('https://aistudio.google.com/app/prompts/new_chat', { waitUntil: 'domcontentloaded' });
+                return true;
+            } catch {
+                return false;
+            }
+        },
         selectors: {
             input: 'footer textarea, textarea, div[contenteditable="true"]',
             runButton: 'button[aria-label*="Run"], button[aria-label*="Send"], button[aria-label*="Submit"]',
@@ -195,7 +319,6 @@ const ADAPTERS = {
             bubble: 'ms-chat-bubble',
             spinner: 'mat-progress-spinner, [class*="loading"], [class*="spinner"]'
         },
-        // DOM-based input method
         setInput: async (page, text) => {
             return await page.evaluate((txt) => {
                 const isVisible = (el) => {
@@ -210,7 +333,6 @@ const ADAPTERS = {
                 const pickBest = (els) => {
                     const visible = Array.from(els || []).filter(isVisible);
                     if (visible.length === 0) return null;
-                    // Prefer the largest visible element (usually the actual prompt box)
                     visible.sort((a, b) => {
                         const ra = a.getBoundingClientRect();
                         const rb = b.getBoundingClientRect();
@@ -229,13 +351,6 @@ const ADAPTERS = {
                     textarea.value = txt;
                     textarea.dispatchEvent(new Event('input', { bubbles: true }));
                     textarea.dispatchEvent(new Event('change', { bubbles: true }));
-
-                    // Angular-specific: trigger ngModelChange if present
-                    const ngModel = textarea.getAttribute('ng-model') || textarea.getAttribute('[(ngModel)]');
-                    if (ngModel) {
-                        textarea.dispatchEvent(new CustomEvent('ngModelChange', { detail: txt, bubbles: true }));
-                    }
-
                     return textarea.value === txt;
                 }
 
@@ -252,322 +367,79 @@ const ADAPTERS = {
                 return false;
             }, text);
         },
-        // DOM-based run trigger
         clickRun: async (page) => {
-            // Prefer Ctrl+Enter because it targets the focused prompt field,
-            // avoiding ambiguity when there are multiple visible Run buttons.
+            // Prefer Ctrl+Enter (AI Studio shortcut)
             try {
-                await page.keyboard.down('Control');
+                const primary = process.platform === 'darwin' ? 'Meta' : 'Control';
+                await page.keyboard.down(primary);
                 await page.keyboard.press('Enter');
-                await page.keyboard.up('Control');
+                await page.keyboard.up(primary);
                 return true;
-            } catch {}
-
-            // Fallback to clicking a visible Run/Send button.
-            return await page.evaluate(() => {
-                const isVisible = (el) => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    if (!style) return false;
-                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                    const r = el.getBoundingClientRect();
-                    return r && r.width > 6 && r.height > 6;
-                };
-
-                const candidates = Array.from(document.querySelectorAll(
-                    'button[aria-label*="Run"], button[aria-label*="Send"], button[aria-label*="Submit"]'
-                ))
-                    .filter(isVisible)
-                    .filter((b) => !b.disabled && b.getAttribute('aria-disabled') !== 'true');
-
-                candidates.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
-                const btn = candidates[0];
-                if (!btn) return false;
-                btn.click();
-                return true;
-            });
-        },
-
-        uploadImages: async (page, images) => {
-            if (!images || !Array.isArray(images) || images.length === 0) return;
-
-            console.log(`📷 Uploading ${images.length} image(s) to AI Studio...`);
-
-            for (let i = 0; i < images.length; i++) {
-                const { mime, buf } = decodeDataUrlToBuffer(images[i]);
-                const ext = extFromMime(mime);
-                const tempPath = path.join(os.tmpdir(), `lotl_upload_${Date.now()}_${i}.${ext}`);
-                fs.writeFileSync(tempPath, buf);
-                console.log(`📁 Temp image ${i + 1}/${images.length}: ${tempPath} (${Math.round(buf.length / 1024)}KB)`);
-
-                let uploaded = false;
-
-                // Strategy 1: Insert menu -> Upload from computer
-                try {
-                    const insertBtn = await page.$('button[aria-label*="Insert"]');
-                    if (insertBtn) {
-                        await insertBtn.click();
-                        await sleep(400);
-
-                        const menuItemSelectors = [
-                            'button[aria-label*="Upload from computer"]',
-                            '[role="menuitem"][aria-label*="Upload"]',
-                            '[role="menu"] button',
-                            '.mat-mdc-menu-content button',
-                            'mat-menu-content button'
-                        ];
-
-                        let menuItem = null;
-                        for (const sel of menuItemSelectors) {
-                            try {
-                                const el = await page.$(sel);
-                                if (el) {
-                                    const text = await el.evaluate(e => (e.textContent || '').toLowerCase());
-                                    const aria = await el.evaluate(e => (e.getAttribute('aria-label') || '').toLowerCase());
-                                    if (aria.includes('upload') || text.includes('upload')) {
-                                        menuItem = el;
-                                        break;
-                                    }
-                                }
-                            } catch {}
-                        }
-
-                        if (menuItem) {
-                            const chooserPromise = page.waitForFileChooser({ timeout: 6000 });
-                            await menuItem.click();
-                            const chooser = await chooserPromise;
-                            await chooser.accept([tempPath]);
-                            uploaded = true;
-                            console.log(`✅ Image ${i + 1} selected via Insert menu`);
-                        }
-
-                        // Close menu if still open
-                        try { await page.keyboard.press('Escape'); } catch {}
-                    }
-                } catch (e) {
-                    console.log(`⚠️ Upload strategy 1 failed: ${e.message}`);
-                    try { await page.keyboard.press('Escape'); } catch {}
-                }
-
-                // Strategy 2: Direct file input
-                if (!uploaded) {
-                    try {
-                        const fileInput = await page.$('input[type="file"]');
-                        if (fileInput) {
-                            await fileInput.uploadFile(tempPath);
-                            uploaded = true;
-                            console.log(`✅ Image ${i + 1} uploaded via direct file input`);
-                        }
-                    } catch (e) {
-                        console.log(`⚠️ Upload strategy 2 failed: ${e.message}`);
-                    }
-                }
-
-                // Strategy 3: Drag-and-drop to prompt box
-                if (!uploaded) {
-                    try {
-                        const b64Only = String(images[i]).replace(/^data:image\/\w+;base64,/, '');
-                        uploaded = await page.evaluate(async (b64Data, extLocal) => {
-                            const byteString = atob(b64Data);
-                            const ab = new ArrayBuffer(byteString.length);
-                            const ia = new Uint8Array(ab);
-                            for (let j = 0; j < byteString.length; j++) {
-                                ia[j] = byteString.charCodeAt(j);
-                            }
-
-                            const blob = new Blob([ab], { type: `image/${extLocal === 'jpg' ? 'jpeg' : extLocal}` });
-                            const file = new File([blob], `upload_${Date.now()}.${extLocal}`, { type: blob.type });
-                            const dataTransfer = new DataTransfer();
-                            dataTransfer.items.add(file);
-
-                            const target = document.querySelector('ms-prompt-box') ||
-                                           document.querySelector('.prompt-box-container') ||
-                                           document.querySelector('footer');
-                            if (!target) return false;
-
-                            target.dispatchEvent(new DragEvent('dragenter', { bubbles: true, dataTransfer }));
-                            target.dispatchEvent(new DragEvent('dragover', { bubbles: true, dataTransfer }));
-                            target.dispatchEvent(new DragEvent('drop', { bubbles: true, dataTransfer }));
-                            return true;
-                        }, b64Only, ext);
-
-                        if (uploaded) {
-                            console.log(`✅ Image ${i + 1} drag-drop dispatched`);
-                        }
-                    } catch (e) {
-                        console.log(`⚠️ Upload strategy 3 failed: ${e.message}`);
-                    }
-                }
-
-                // Wait for UI to show an attachment chip/preview
-                if (uploaded) {
-                    try {
-                        await sleep(1200);
-                        await withTimeout(
-                            page.waitForFunction(() => {
-                                const indicators = [
-                                    'ms-img-media',
-                                    '[class*="media-chip"]',
-                                    '[class*="file-chip"]',
-                                    '.prompt-box-container img',
-                                    'img[src*="blob:"]',
-                                    '[aria-label*="Remove"]'
-                                ];
-                                return indicators.some(sel => document.querySelector(sel));
-                            }, { timeout: 8000 }),
-                            9000,
-                            'Image preview did not appear in time'
-                        );
-                        console.log(`✅ Image ${i + 1} verified in UI`);
-                    } catch (e) {
-                        console.log(`⚠️ Image ${i + 1} uploaded but preview not detected: ${e.message}`);
-                    }
-                } else {
-                    console.log(`❌ Image ${i + 1} upload failed (all strategies exhausted)`);
-                }
-
-                // Cleanup temp file
-                try { fs.unlinkSync(tempPath); } catch {}
-
-                // Small delay between images
-                if (i < images.length - 1) {
-                    await sleep(400);
-                }
+            } catch {
+                // ignore
             }
 
-            console.log('📷 Image upload step complete');
+            return await page.evaluate(() => {
+                const selectors = [
+                    'button[aria-label*="Run"]',
+                    'button[aria-label*="Send"]',
+                    'button[aria-label*="Submit"]'
+                ];
+                for (const sel of selectors) {
+                    const btn = document.querySelector(sel);
+                    if (btn && !btn.disabled) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            });
         },
-        // DOM-based response extraction
-        // NOTE: Do NOT clone custom elements here. cloneNode() does not preserve shadow DOM
-        // and often results in empty innerText.
         extractResponse: async (page) => {
             return await page.evaluate(() => {
-                function deepText(node) {
-                    if (!node) return '';
-                    // Text node
-                    if (node.nodeType === Node.TEXT_NODE) {
-                        return node.nodeValue || '';
-                    }
-                    // Element node
-                    if (node.nodeType === Node.ELEMENT_NODE) {
-                        const el = /** @type {HTMLElement} */ (node);
-                        const tag = (el.tagName || '').toLowerCase();
-
-                        // Skip obvious UI noise
-                        if (tag === 'button' || tag === 'mat-icon') return '';
-                        const cls = (el.className && String(el.className)) ? String(el.className).toLowerCase() : '';
-                        if (cls.includes('icon') || cls.includes('action') || cls.includes('menu') || cls.includes('feedback')) return '';
-                        const aria = (el.getAttribute && el.getAttribute('aria-label')) ? String(el.getAttribute('aria-label')).toLowerCase() : '';
-                        if (aria.includes('copy') || aria.includes('thumb') || aria.includes('rate') || aria.includes('feedback')) return '';
-
-                        let out = '';
-                        // Light separators for block-ish elements
-                        if (tag === 'br') return '\n';
-
-                        // Walk light DOM
-                        if (el.childNodes && el.childNodes.length) {
-                            for (const child of el.childNodes) {
-                                out += deepText(child);
-                            }
-                        }
-                        // Walk shadow DOM
-                        const sr = /** @type {any} */ (el).shadowRoot;
-                        if (sr && sr.childNodes && sr.childNodes.length) {
-                            for (const child of sr.childNodes) {
-                                out += deepText(child);
-                            }
-                        }
-
-                        // Add newlines after common block containers
-                        if (tag === 'p' || tag === 'div' || tag === 'li' || tag === 'pre' || tag === 'section' || tag === 'article') {
-                            out += '\n';
-                        }
-
-                        return out;
-                    }
-                    return '';
-                }
-
-                function cleanTurnText(raw) {
-                    let t = String(raw || '');
-                    t = t.replace(/\r\n/g, '\n');
-
-                    // Remove common UI tokens that appear inline.
-                    t = t.replace(/\b(edit|more_vert|thumb_up|thumb_down|content_copy|download)\b/gi, ' ');
-                    t = t.replace(/\b\d+(?:\.\d+)?s\b/g, ' ');
-                    t = t.replace(/\s+/g, ' ').trim();
-
-                    // Strip leading role labels.
-                    t = t.replace(/^\s*(User|Model)\s+/i, '');
-
-                    // Remove citation brackets.
-                    t = t.replace(/\[\d+\]/g, '');
-
-                    return t.trim();
-                }
-
                 const turns = document.querySelectorAll('ms-chat-turn');
                 if (turns.length === 0) return null;
 
-                // Prefer the most recent Model turn (avoid returning the user prompt).
-                let best = null;
+                const clean = (s) => String(s || '').replace(/\r\n/g, '\n').replace(/\s+/g, ' ').trim();
+
+                // Prefer most recent turn text.
                 for (let i = turns.length - 1; i >= 0; i--) {
-                    const t = turns[i];
-                    let raw = (t.innerText || '').trim();
-                    if (!raw) raw = deepText(t);
-                    if (!raw || raw.trim().length === 0) continue;
-
-                    const cleaned = cleanTurnText(raw);
-                    if (!cleaned) continue;
-
-                    const looksLikeModel = /\bModel\b/i.test(raw);
-                    const looksLikeUser = /\bUser\b/i.test(raw);
-
-                    if (looksLikeModel && !looksLikeUser) {
-                        return cleaned;
-                    }
-
-                    // Keep as fallback in case we can't find a Model-labelled turn.
-                    if (!best) best = cleaned;
+                    const t = clean(turns[i].innerText || turns[i].textContent || '');
+                    if (t && t.length > 0) return t;
                 }
-
-                return best;
+                return null;
             });
         },
-        // Get current turn count
         getTurnCount: async (page) => {
-            return await page.evaluate(() => {
-                return document.querySelectorAll('ms-chat-turn').length;
-            });
+            return await page.evaluate(() => document.querySelectorAll('ms-chat-turn').length);
         },
-        // Check if still generating
         isGenerating: async (page) => {
             return await page.evaluate(() => {
-                // Primary signal: when "Run" is visible + enabled, generation is complete.
                 const runBtn = document.querySelector('button[aria-label*="Run"]');
                 if (runBtn && runBtn.offsetParent !== null && !runBtn.disabled) return false;
-
-                // Secondary signals: Stop visible OR loading spinners visible -> generating.
                 const stopBtn = document.querySelector('button[aria-label*="Stop"]');
                 if (stopBtn && stopBtn.offsetParent !== null) return true;
-
-                const spinners = document.querySelectorAll(
-                    'mat-progress-spinner, [class*="loading"], [class*="spinner"]'
-                );
+                const spinners = document.querySelectorAll('mat-progress-spinner, [class*="loading"], [class*="spinner"]');
                 for (const s of spinners) {
                     if (s.offsetParent !== null) return true;
                 }
-
-                // Fallback: if we can't prove it's generating, assume not generating.
                 return false;
             });
         }
     },
-    
+
     chatgpt: {
         name: 'ChatGPT',
         urlPattern: 'chatgpt.com',
         launchUrl: 'https://chatgpt.com',
+        clickNewChat: async (page) => {
+            try {
+                await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded' });
+                return true;
+            } catch {
+                return false;
+            }
+        },
         selectors: {
             input: '#prompt-textarea, textarea[data-id="root"], div[contenteditable="true"][data-placeholder]',
             sendButton: 'button[data-testid="send-button"], button[aria-label*="Send"]',
@@ -577,27 +449,23 @@ const ADAPTERS = {
         },
         setInput: async (page, text) => {
             return await page.evaluate((txt) => {
-                // ChatGPT uses contenteditable div or textarea
                 const selectors = [
                     '#prompt-textarea',
-                    'textarea[data-id="root"]', 
+                    'textarea[data-id="root"]',
                     'div[contenteditable="true"][data-placeholder]',
                     'div[contenteditable="true"]'
                 ];
-                
                 for (const sel of selectors) {
                     const el = document.querySelector(sel);
                     if (!el) continue;
-                    
                     el.focus();
-                    
                     if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
                         el.value = txt;
                         el.dispatchEvent(new Event('input', { bubbles: true }));
                         el.dispatchEvent(new Event('change', { bubbles: true }));
                         return true;
-                    } else if (el.contentEditable === 'true') {
-                        // ContentEditable div
+                    }
+                    if (el.contentEditable === 'true') {
                         el.innerHTML = '';
                         el.innerText = txt;
                         el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -614,7 +482,6 @@ const ADAPTERS = {
                     'button[aria-label*="Send"]',
                     'button[aria-label*="send"]'
                 ];
-                
                 for (const sel of selectors) {
                     const btn = document.querySelector(sel);
                     if (btn && !btn.disabled) {
@@ -627,13 +494,166 @@ const ADAPTERS = {
         },
         extractResponse: async (page) => {
             return await page.evaluate(() => {
-                // ChatGPT response messages
-                const selectors = [
-                    '[data-message-author-role="assistant"]',
-                    '.agent-turn .markdown',
-                    '[class*="assistant-message"]'
-                ];
+                const els = document.querySelectorAll('[data-message-author-role="assistant"]');
+                if (!els || els.length === 0) return null;
+                const last = els[els.length - 1];
+                return (last.innerText || last.textContent || '').trim();
+            });
+        },
+        getTurnCount: async (page) => {
+            return await page.evaluate(() => document.querySelectorAll('[data-message-author-role="assistant"]').length);
+        },
+        isGenerating: async (page) => {
+            return await page.evaluate(() => {
+                const stopBtn = document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"]');
+                if (stopBtn && stopBtn.offsetParent !== null) return true;
+                const streaming = document.querySelector('[class*="streaming"]');
+                return Boolean(streaming);
+            });
+        }
+    },
+
+    gemini: {
+        name: 'Gemini',
+        urlPattern: 'gemini.google.com',
+        launchUrl: 'https://gemini.google.com/app',
+        shortcutOnly: true,
+        clickNewChat: async (page) => {
+            try {
+                if (!String(page.url() || '').includes('gemini.google.com/app')) {
+                    await page.goto('https://gemini.google.com/app', { waitUntil: 'domcontentloaded' });
+                }
+            } catch {
+                // ignore
+            }
+
+            try {
+                // Native Gemini new chat: Ctrl/Cmd + Shift + O (or 0)
+                for (const key of ['KeyO', 'Digit0']) {
+                    await pressComboRdpSafe(page, { primary: true, shift: true, key });
+                    await sleep(150);
+                }
+                return true;
+            } catch {
+                return false;
+            }
+        },
+        setInput: async (page, text) => {
+            // After new chat, the input box moves to CENTER of page (different element).
+            // Click/focus the actual visible input box instead of relying on Shift+Esc.
+            return await withClipboardRestored(async () => {
+                const promptText = String(text || '');
+                const clipboardOk = await setClipboardTextVerified(promptText, { retries: 5, delayMs: 80 });
+
+                // Click/focus the visible input box (wherever it is - bottom or center)
+                const focused = await page.evaluate(() => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (!style) return false;
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                        const r = el.getBoundingClientRect();
+                        return r && r.width > 10 && r.height > 10;
+                    };
+
+                    // Gemini uses rich-textarea with Quill editor or contenteditable
+                    const selectors = [
+                        'rich-textarea .ql-editor',
+                        'div.ql-editor[contenteditable="true"]',
+                        'div[contenteditable="true"][aria-label*="prompt" i]',
+                        'div[contenteditable="true"][aria-label*="Enter" i]',
+                        'div[contenteditable="true"]',
+                        'textarea'
+                    ];
+
+                    for (const sel of selectors) {
+                        const candidates = Array.from(document.querySelectorAll(sel)).filter(isVisible);
+                        if (candidates.length === 0) continue;
+                        // Pick largest visible one
+                        candidates.sort((a, b) => {
+                            const ra = a.getBoundingClientRect();
+                            const rb = b.getBoundingClientRect();
+                            return (rb.width * rb.height) - (ra.width * ra.height);
+                        });
+                        const el = candidates[0];
+                        el.focus();
+                        el.click();
+                        return true;
+                    }
+                    return false;
+                });
+
+                if (!focused) {
+                    // Fallback: try Shift+Esc
+                    try {
+                        await pressCombo(page, { primary: false, shift: true, key: 'Escape' });
+                        await sleep(80);
+                    } catch {
+                        // ignore
+                    }
+                }
+
+                await sleep(100);
+
+                // Always use paste - never type (bot detection, large prompts).
+                // Retry paste multiple times if clipboard didn't verify on first try.
+                for (let attempt = 0; attempt < 3; attempt++) {
+                    if (!clipboardOk) {
+                        // Retry setting clipboard
+                        await setClipboardTextVerified(promptText, { retries: 5, delayMs: 100 });
+                    }
+                    // Paste: try Ctrl+V and Cmd+V to handle RDP remapping.
+                    await pressComboRdpSafe(page, { primary: true, shift: false, key: 'KeyV' });
+                    await sleep(200);
+                    
+                    // Verify paste worked by checking input content
+                    const hasContent = await page.evaluate(() => {
+                        const selectors = [
+                            'rich-textarea .ql-editor',
+                            'div.ql-editor[contenteditable="true"]',
+                            'div[contenteditable="true"]',
+                            'textarea'
+                        ];
+                        for (const sel of selectors) {
+                            const el = document.querySelector(sel);
+                            if (el) {
+                                const text = (el.innerText || el.value || '').trim();
+                                if (text.length > 5) return true;
+                            }
+                        }
+                        return false;
+                    });
+                    
+                    if (hasContent) return true;
+                    await sleep(150);
+                }
                 
+                // If paste still failed, throw error rather than typing (bot detection risk)
+                throw new Error('Clipboard paste failed after retries - check RDP clipboard settings');
+            });
+        },
+        clickRun: async (page) => {
+            // Gemini Web UI: Enter usually sends.
+            try {
+                await page.keyboard.press('Enter');
+                return true;
+            } catch {
+                return false;
+            }
+        },
+        extractResponse: async (page) => {
+            // DOM-based extraction (clipboard shortcuts unreliable under RDP)
+            return await page.evaluate(() => {
+                // Gemini model responses - try multiple selectors
+                const selectors = [
+                    '.model-response-text',
+                    '.response-container message-content',
+                    '[data-message-author-role="model"]',
+                    '.markdown-main-panel',
+                    '.response-content',
+                    '[class*="model-response"]'
+                ];
+
                 let messages = [];
                 for (const sel of selectors) {
                     const els = document.querySelectorAll(sel);
@@ -642,25 +662,28 @@ const ADAPTERS = {
                         break;
                     }
                 }
-                
+
+                if (messages.length === 0) {
+                    // Broader fallback: look for any message-like containers
+                    const fallback = document.querySelectorAll('[class*="response"], [class*="message"]');
+                    if (fallback.length > 0) {
+                        messages = Array.from(fallback).filter(el => {
+                            const text = (el.innerText || '').trim();
+                            return text.length > 5;
+                        });
+                    }
+                }
+
                 if (messages.length === 0) return null;
-                
+
                 const lastMsg = messages[messages.length - 1];
-                const clone = lastMsg.cloneNode(true);
-                
-                // Remove UI elements
-                clone.querySelectorAll('button, [class*="copy"], [class*="action"]')
-                    .forEach(el => el.remove());
-                
-                return (clone.innerText || clone.textContent || '').trim();
+                const text = (lastMsg.innerText || lastMsg.textContent || '').trim();
+                return text || null;
             });
         },
         getTurnCount: async (page) => {
             return await page.evaluate(() => {
-                const selectors = [
-                    '[data-message-author-role="assistant"]',
-                    '.agent-turn'
-                ];
+                const selectors = ['.model-response-text', '[data-message-author-role="model"]', '[class*="model-response"]'];
                 for (const sel of selectors) {
                     const count = document.querySelectorAll(sel).length;
                     if (count > 0) return count;
@@ -671,19 +694,11 @@ const ADAPTERS = {
         isGenerating: async (page) => {
             return await page.evaluate(() => {
                 // Check for stop button
-                const stopBtn = document.querySelector(
-                    'button[data-testid="stop-button"], button[aria-label*="Stop"]'
-                );
+                const stopBtn = document.querySelector('button[aria-label*="Stop" i]');
                 if (stopBtn && stopBtn.offsetParent !== null) return true;
-                
-                // Check for streaming indicator
-                const streaming = document.querySelector('[class*="streaming"]');
-                if (streaming) return true;
-                
-                // Check if send button is disabled (generating)
-                const sendBtn = document.querySelector('button[data-testid="send-button"]');
-                if (sendBtn && sendBtn.disabled) return true;
-                
+                // Check for loading/progress indicators
+                const loading = document.querySelector('[class*="loading"], [class*="progress"], mat-progress-spinner, [class*="streaming"]');
+                if (loading && loading.offsetParent !== null) return true;
                 return false;
             });
         }
@@ -700,9 +715,253 @@ class LotlController {
         // lockKey -> Promise chain
         this._locks = new Map();
         // In single mode, we should never accumulate tabs even if a prior request died mid-flight.
-        // Track last ephemeral per platform and forcibly close it before starting a new request.
-        this._singleEphemeralByPlatform = new Map();
+        // Track *all* ephemeral tabs we've created so we can sweep leaks.
+        this._singleEphemeralPagesByPlatform = new Map(); // platform -> Set<Page>
+        this._singleEphemeralMeta = new WeakMap(); // Page -> { platform, createdAt }
         this._connectLock = Promise.resolve();
+    }
+
+    _getSingleEphemeralSet(platform) {
+        const key = String(platform || '').toLowerCase();
+        let set = this._singleEphemeralPagesByPlatform.get(key);
+        if (!set) {
+            set = new Set();
+            this._singleEphemeralPagesByPlatform.set(key, set);
+        }
+        return set;
+    }
+
+    _trackSingleEphemeral(platform, page) {
+        if (!page) return;
+        const set = this._getSingleEphemeralSet(platform);
+        set.add(page);
+        if (!this._singleEphemeralMeta.has(page)) {
+            this._singleEphemeralMeta.set(page, { platform: String(platform || ''), createdAt: Date.now() });
+        }
+        // Auto-untrack when it closes.
+        try {
+            page.once('close', () => {
+                try {
+                    const s = this._getSingleEphemeralSet(platform);
+                    s.delete(page);
+                } catch {
+                    // ignore
+                }
+            });
+        } catch {
+            // ignore
+        }
+    }
+
+    async _closePageQuiet(page) {
+        if (!page) return;
+        await page.close({ runBeforeUnload: false }).catch(() => undefined);
+    }
+
+    async _cleanupSingleEphemeral(platform, keepPage = null) {
+        if (this.mode !== 'single') return;
+
+        const set = this._getSingleEphemeralSet(platform);
+        const victims = Array.from(set).filter(p => p && p !== keepPage);
+
+        // Close all tracked ephemerals for this platform except the current one.
+        for (const p of victims) {
+            // Only close if still healthy; otherwise just drop it from tracking.
+            if (await this._ensurePageHealthy(p)) {
+                await this._closePageQuiet(p);
+            }
+            set.delete(p);
+        }
+
+        // Enforce per-platform cap (defaults to 1)
+        while (set.size > Math.max(1, SINGLE_MAX_EPHEMERAL_PER_PLATFORM)) {
+            const arr = Array.from(set);
+            const oldest = arr
+                .map(p => ({ p, t: (this._singleEphemeralMeta.get(p) || {}).createdAt || 0 }))
+                .sort((a, b) => a.t - b.t)[0];
+            if (!oldest || !oldest.p) break;
+            await this._closePageQuiet(oldest.p);
+            set.delete(oldest.p);
+        }
+
+        // Enforce global cap across platforms
+        const all = [];
+        for (const s of this._singleEphemeralPagesByPlatform.values()) {
+            for (const p of s.values()) {
+                all.push({ p, t: (this._singleEphemeralMeta.get(p) || {}).createdAt || 0 });
+            }
+        }
+        const maxTotal = Math.max(1, SINGLE_MAX_EPHEMERAL_TOTAL);
+        if (all.length > maxTotal) {
+            all.sort((a, b) => a.t - b.t);
+            const over = all.length - maxTotal;
+            for (let i = 0; i < over; i++) {
+                const victim = all[i] && all[i].p;
+                if (victim && victim !== keepPage) {
+                    await this._closePageQuiet(victim);
+                    try {
+                        const meta = this._singleEphemeralMeta.get(victim);
+                        const plat = meta && meta.platform ? String(meta.platform).toLowerCase() : null;
+                        if (plat) this._getSingleEphemeralSet(plat).delete(victim);
+                    } catch {
+                        // ignore
+                    }
+                }
+            }
+        }
+    }
+
+    _isRetryableUiOrCdpError(err) {
+        const msg = String((err && err.message) ? err.message : err || '').toLowerCase();
+        if (!msg) return false;
+
+        const patterns = [
+            'target closed',
+            'session closed',
+            'connection closed',
+            'protocol error',
+            'execution context was destroyed',
+            'most likely the page has been closed',
+            'detached',
+            'browser has disconnected',
+            'disconnected',
+            'net::err',
+        ];
+
+        return patterns.some(p => msg.includes(p));
+    }
+
+    async _resetPlatformCache(platform, sessionId) {
+        const sid = this._normalizeSessionId(sessionId);
+        const key = this._cacheKey(platform, sid);
+        const cached = this._pageCache.get(key);
+        this._pageCache.delete(key);
+        if (cached && cached.page) {
+            await cached.page.close({ runBeforeUnload: false }).catch(() => undefined);
+        }
+    }
+
+    async _forceReconnectChrome() {
+        // Clear local state and force a reconnect on next ensureConnection().
+        if (this.browser) {
+            try {
+                await this.browser.disconnect();
+            } catch {
+                // ignore
+            }
+        }
+        this.browser = null;
+        this._pageCache.clear();
+        this._locks.clear();
+        this._singleEphemeralPagesByPlatform.clear();
+    }
+
+    async dismissInterruptions(platform, page) {
+        if (!page) return { actions: 0 };
+
+        // Quick no-op if page is already dead.
+        if (!await this._ensurePageHealthy(page)) return { actions: 0, dead: true };
+
+        let actions = 0;
+        try {
+            // ESC often closes tooltips/modals; safe across sites.
+            await page.keyboard.press('Escape').catch(() => undefined);
+        } catch {
+            // ignore
+        }
+
+        // DOM-based dismissal: close buttons, "not now", backdrop clicks.
+        try {
+            const r = await page.evaluate((platformName) => {
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (!style) return false;
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect && rect.width > 5 && rect.height > 5;
+                };
+
+                const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const click = (el) => {
+                    try { el.click(); return true; } catch { return false; }
+                };
+
+                let actions = 0;
+
+                // 1) Click common close buttons
+                const closeSelectors = [
+                    'button[aria-label="Close"]',
+                    'button[aria-label*="close" i]',
+                    '[role="dialog"] button[aria-label*="close" i]',
+                    'button[data-testid*="close" i]',
+                    'button[class*="close" i]',
+                    'button[title*="close" i]'
+                ];
+                for (const sel of closeSelectors) {
+                    const candidates = Array.from(document.querySelectorAll(sel)).filter(isVisible);
+                    for (const c of candidates.slice(0, 3)) {
+                        if (click(c)) actions++;
+                    }
+                }
+
+                // 2) Click "Not now" / "Dismiss" / "Got it" / "OK" / "Close" by text
+                const allowText = [
+                    'not now',
+                    'dismiss',
+                    'got it',
+                    'ok',
+                    'close',
+                    'no thanks'
+                ];
+                const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(isVisible);
+                for (const b of buttons.slice(0, 80)) {
+                    const t = norm(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
+                    if (!t) continue;
+                    if (allowText.includes(t) || allowText.some(x => t === x)) {
+                        if (click(b)) actions++;
+                    }
+                }
+
+                // 3) Click common backdrops (Angular Material / general)
+                const backdrops = [
+                    '.cdk-overlay-backdrop',
+                    '.cdk-global-overlay-wrapper',
+                    '[data-testid="modal-backdrop"]',
+                    '[class*="backdrop" i]'
+                ];
+                for (const sel of backdrops) {
+                    const els = Array.from(document.querySelectorAll(sel)).filter(isVisible);
+                    for (const e of els.slice(0, 2)) {
+                        // Avoid clicking inside dialogs; backdrops are usually behind.
+                        if (click(e)) actions++;
+                    }
+                }
+
+                // 4) Platform-specific nudges
+                if (platformName === 'chatgpt') {
+                    // Occasionally there's a small "Close" X in top-right areas.
+                    const svgClose = Array.from(document.querySelectorAll('button svg')).slice(0, 50)
+                        .map(svg => svg.closest('button'))
+                        .filter(Boolean)
+                        .filter(isVisible);
+                    for (const btn of svgClose.slice(0, 2)) {
+                        const t = norm(btn.getAttribute('aria-label') || btn.title || btn.textContent || '');
+                        if (t.includes('close')) {
+                            if (click(btn)) actions++;
+                        }
+                    }
+                }
+
+                return { actions };
+            }, platform);
+
+            actions += Number(r && r.actions ? r.actions : 0);
+        } catch {
+            // ignore
+        }
+
+        return { actions };
     }
 
     _normalizeSessionId(sessionId) {
@@ -740,7 +999,7 @@ class LotlController {
                 this.browser = null;
                 this._pageCache.clear();
                 this._locks.clear();
-                this._singleEphemeralByPlatform.clear();
+                this._singleEphemeralPagesByPlatform.clear();
             });
 
             console.log('✅ Connected to Chrome');
@@ -762,7 +1021,25 @@ class LotlController {
     async _waitForUsableInput(platform, page) {
         const adapter = ADAPTERS[platform];
         if (!adapter) return;
+        if (adapter.shortcutOnly) return;
+        if (!adapter.selectors || !adapter.selectors.input) return;
         await page.waitForSelector(adapter.selectors.input, { timeout: 20000 });
+    }
+
+    async _ensureNewChat(platform, page, adapter) {
+        if (!adapter || typeof adapter.clickNewChat !== 'function') return;
+
+        // Requirement: in single mode, always start from a clean chat.
+        // Also applied on first tab creation in multi mode to avoid inheriting "last chat" state.
+        try {
+            const ok = await adapter.clickNewChat(page);
+            if (ok) {
+                await humanPause();
+                await this.dismissInterruptions(platform, page).catch(() => undefined);
+            }
+        } catch {
+            // Best-effort; do not fail the request solely because "new chat" wasn't clickable.
+        }
     }
 
     async _createFreshPage(platform) {
@@ -770,9 +1047,14 @@ class LotlController {
         if (!adapter) throw new Error(`Unknown platform: ${platform}`);
         await this._ensureBrowserConnected();
 
+        // Single-mode hygiene: close any leaked ephemerals before opening yet another tab.
+        await this._cleanupSingleEphemeral(platform).catch(() => undefined);
+
         const page = await this.browser.newPage();
+        this._trackSingleEphemeral(platform, page);
         const url = adapter.launchUrl || `https://${adapter.urlPattern}`;
         await page.goto(url, { waitUntil: 'domcontentloaded' });
+        await this._ensureNewChat(platform, page, adapter);
         await this._waitForUsableInput(platform, page);
         return { page, adapter, ephemeral: true };
     }
@@ -819,6 +1101,19 @@ class LotlController {
             const key = this._cacheKey(platform, sid);
             const cached = this._pageCache.get(key);
             if (cached && cached.page && await this._ensurePageHealthy(cached.page)) {
+                // If the tab drifted off-domain (e.g. logged out redirect / blank tab), recover by reloading.
+                try {
+                    const u = String(cached.page.url ? cached.page.url() : '');
+                    if (!u.includes(adapter.urlPattern)) {
+                        const url = adapter.launchUrl || `https://${adapter.urlPattern}`;
+                        await cached.page.goto(url, { waitUntil: 'domcontentloaded' });
+                        await this._waitForUsableInput(platform, cached.page);
+                    }
+                } catch {
+                    // If recovery fails, fall through to creating a new page.
+                    try { await cached.page.close({ runBeforeUnload: false }); } catch {}
+                    this._pageCache.delete(key);
+                }
                 cached.lastUsedAt = Date.now();
                 return { page: cached.page, adapter, ephemeral: false };
             }
@@ -827,6 +1122,7 @@ class LotlController {
             const page = await this.browser.newPage();
             const url = adapter.launchUrl || `https://${adapter.urlPattern}`;
             await page.goto(url, { waitUntil: 'domcontentloaded' });
+            await this._ensureNewChat(platform, page, adapter);
             await this._waitForUsableInput(platform, page);
 
             // Enforce a simple per-platform cap.
@@ -1110,215 +1406,206 @@ class LotlController {
         return await this.withLock(lockKey, async () => {
             console.log(`\n📩 [${platform.toUpperCase()}] Processing prompt (${prompt.length} chars)...`);
 
-            let conn;
-            try {
-                if (this.mode === 'single') {
-                    const prev = this._singleEphemeralByPlatform.get(platform);
-                    if (prev && await this._ensurePageHealthy(prev)) {
-                        await prev.close({ runBeforeUnload: false }).catch(() => undefined);
+            const runAttempt = async (attempt) => {
+                let conn;
+                try {
+                    if (this.mode === 'single') {
+                        await this._cleanupSingleEphemeral(platform).catch(() => undefined);
                     }
-                    this._singleEphemeralByPlatform.delete(platform);
-                }
 
-                conn = await this.ensureConnection(platform, sessionId);
-                const { page, adapter } = conn;
+                    conn = await this.ensureConnection(platform, sessionId);
+                    const { page, adapter } = conn;
 
-                if (this.mode === 'single' && conn.ephemeral) {
-                    this._singleEphemeralByPlatform.set(platform, page);
-                }
-                await page.bringToFront();
-                await humanPause();
-
-            // Production guard: detect common AI Studio blockers early.
-            if (platform === 'aistudio') {
-                const blockers = await page.evaluate(() => {
-                    const hay = (document.body && document.body.innerText) ? document.body.innerText : '';
-                    const patterns = [
-                        /Sign in/i,
-                        /Verify it's you/i,
-                        /unusual traffic/i,
-                        /captcha/i,
-                        /Something went wrong/i
-                    ];
-                    return patterns.filter(p => p.test(hay)).map(p => p.toString());
-                });
-                if (Array.isArray(blockers) && blockers.length > 0) {
-                    throw new Error(`AI Studio is blocked (${blockers.join(', ')}). Fix the tab state (login / API key prompt) and retry.`);
-                }
-            }
-            
-            // Scroll to bottom
-            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-            await sleep(300);
-            
-            // Get turn count BEFORE
-            const turnsBefore = await adapter.getTurnCount(page);
-            console.log(`📊 Turns before: ${turnsBefore}`);
-
-            // Capture the current extracted response so we can detect stale/non-updating extraction.
-            const preSendExtract = platform === 'aistudio'
-                ? String(await adapter.extractResponse(page) || '').trim()
-                : '';
-
-            const expectedExact = platform === 'aistudio' ? parseExpectedExactToken(prompt) : null;
-
-            // Upload images if supported by this adapter
-            if (images && Array.isArray(images) && images.length > 0) {
-                if (typeof adapter.uploadImages === 'function') {
-                    await adapter.uploadImages(page, images);
-                } else {
-                    console.log(`📷 Images provided (${images.length}) but adapter does not support uploads; ignoring`);
-                }
-            }
-                await humanPause();
-            
-            // SET INPUT via DOM
-            console.log(`⌨️ Setting input via DOM...`);
-            const inputSet = await adapter.setInput(page, prompt);
-            if (!inputSet) {
-                throw new Error('Failed to set input - selector not found');
-            }
-            await sleep(300);
-                await humanPause();
-            
-            // CLICK RUN via DOM
-            console.log(`🚀 Clicking run/send...`);
-            const clicked = await adapter.clickRun(page);
-            if (!clicked) {
-                throw new Error('Failed to click run/send button');
-            }
-            
-            // WAIT FOR RESPONSE
-            console.log(`⏳ Waiting for response...`);
-            let gotResponse = false;
-
-            // AI Studio reliably produces 2 turns (user + model). ChatGPT patterns differ.
-            const requiredTurnDelta = platform === 'aistudio' ? 2 : 1;
-            
-            for (let i = 0; i < 180; i++) {  // Up to 3 minutes
-                await sleep(1000);
-                
-                const turnsNow = await adapter.getTurnCount(page);
-                const generating = await adapter.isGenerating(page);
-                
-                // We need sufficient new turns and not generating
-                if (turnsNow >= turnsBefore + requiredTurnDelta && !generating) {
-                    gotResponse = true;
-                    console.log(`📊 Turns after: ${turnsNow}`);
-                    break;
-                }
-                
-                // Log progress every 10 seconds
-                if (i > 0 && i % 10 === 0) {
-                    console.log(`   ... still waiting (${i}s, turns: ${turnsNow}, generating: ${generating})`);
-                }
-            }
-            
-            if (!gotResponse) {
-                throw new Error('Timeout waiting for response (3 min)');
-            }
-            
-            // WAIT FOR STREAMING TO COMPLETE
-            console.log(`⏳ Waiting for streaming to complete...`);
-            let lastText = '';
-            let stableCount = 0;
-            
-            for (let i = 0; i < 60; i++) {  // Up to 60 seconds for streaming
-                await sleep(1000);
-                
-                const currentText = await adapter.extractResponse(page);
-                
-                if (currentText === lastText && currentText && currentText.length > 0) {
-                    stableCount++;
-                    if (stableCount >= 3) {  // Stable for 3 seconds
-                        console.log(`✅ Response complete (stable for 3s)`);
-                        break;
+                    if (this.mode === 'single' && conn.ephemeral) {
+                        this._trackSingleEphemeral(platform, page);
                     }
-                } else {
-                    stableCount = 0;
-                    lastText = currentText;
-                }
-            }
+                    await page.bringToFront();
+                    await humanPause();
+
+                    const swept = await this.dismissInterruptions(platform, page);
+                    if (swept && swept.actions && swept.actions > 0) {
+                        console.log(`🧹 Dismissed interruptions: ${swept.actions}`);
+                        await humanPause();
+                    }
+
+                    // Production guard: detect common AI Studio blockers early.
+                    if (platform === 'aistudio') {
+                        const blockers = await page.evaluate(() => {
+                            const hay = (document.body && document.body.innerText) ? document.body.innerText : '';
+                            const patterns = [
+                                /Sign in/i,
+                                /Verify it's you/i,
+                                /unusual traffic/i,
+                                /captcha/i,
+                                /Something went wrong/i
+                            ];
+                            return patterns.filter(p => p.test(hay)).map(p => p.toString());
+                        });
+                        if (Array.isArray(blockers) && blockers.length > 0) {
+                            throw new Error(`AI Studio is blocked (${blockers.join(', ')}). Fix the tab state (login / API key prompt) and retry.`);
+                        }
+                    }
             
-            // EXTRACT FINAL RESPONSE
-            let response = await adapter.extractResponse(page);
-            const responseStr = String(response || '').trim();
-            const looksLikeThoughtsOnly = /Expand to view model thoughts/i.test(responseStr) || /^Thoughts\b/i.test(responseStr);
+                    const expectedExact = platform === 'aistudio' ? parseExpectedExactToken(prompt) : null;
+
+                    // API mode: behave like an API by starting a fresh chat every request.
+                    if (this.mode === 'api') {
+                        await this._ensureNewChat(platform, page, adapter);
+                        await humanPause();
+                    }
+
+                    // Upload images if supported by this adapter
+                    if (images && Array.isArray(images) && images.length > 0) {
+                        if (typeof adapter.uploadImages === 'function') {
+                            await adapter.uploadImages(page, images);
+                        } else {
+                            console.log(`📷 Images provided (${images.length}) but adapter does not support uploads; ignoring`);
+                        }
+                    }
+                    await humanPause();
+            
+                    // SET INPUT
+                    console.log(`⌨️ Setting input...`);
+                    const inputSet = await adapter.setInput(page, prompt);
+                    if (!inputSet) {
+                        // Sometimes an overlay blocks focus; sweep and retry input once.
+                        await this.dismissInterruptions(platform, page).catch(() => undefined);
+                        await humanPause();
+                        const inputSet2 = await adapter.setInput(page, prompt);
+                        if (!inputSet2) {
+                            throw new Error('Failed to set input - selector not found');
+                        }
+                    }
+                    await sleep(300);
+                    await humanPause();
+            
+                    // CLICK RUN via DOM
+                    console.log(`🚀 Clicking run/send...`);
+                    const clicked = await adapter.clickRun(page);
+                    if (!clicked) {
+                        await this.dismissInterruptions(platform, page).catch(() => undefined);
+                        await humanPause();
+                        const clicked2 = await adapter.clickRun(page);
+                        if (!clicked2) {
+                            throw new Error('Failed to click run/send button');
+                        }
+                    }
+            
+                    // WAIT FOR RESPONSE
+                    console.log(`⏳ Waiting for response...`);
+                    let response = null;
+                    if (adapter && adapter.shortcutOnly) {
+                        // Shortcut-only platforms: poll clipboard-based extraction until stable.
+                        let lastText = '';
+                        let stableCount = 0;
+                        const maxSeconds = 180;
+                        for (let i = 0; i < maxSeconds; i++) {
+                            await sleep(1000);
+                            if (i > 0 && i % 10 === 0) {
+                                await this.dismissInterruptions(platform, page).catch(() => undefined);
+                            }
+
+                            const cur = String(await adapter.extractResponse(page) || '').trim();
+                            if (!cur) continue;
+
+                            if (cur === lastText) {
+                                stableCount++;
+                                if (stableCount >= 3) {
+                                    response = cur;
+                                    break;
+                                }
+                            } else {
+                                lastText = cur;
+                                stableCount = 0;
+                            }
+                        }
+                        if (!response) {
+                            // fall back to last seen non-empty text
+                            response = lastText || null;
+                        }
+                    } else {
+                        // DOM-based platforms
+                        response = await adapter.extractResponse(page);
+                    }
+
+                    const responseStr = String(response || '').trim();
+                    const looksLikeThoughtsOnly = /Expand to view model thoughts/i.test(responseStr) || /^Thoughts\b/i.test(responseStr);
 
             // If the prompt asks for an exact token, validate we got that token.
             // This catches cases where the generic "latest model turn" extractor returns a stale/previous reply.
 
-            if (!response || responseStr.length === 0 || (platform === 'aistudio' && looksLikeThoughtsOnly)) {
-                const fallback = await this.extractFallback(platform, page, prompt);
-                if (fallback && fallback.trim().length > 0) {
-                    console.log(`✅ Got response via fallback (${fallback.length} chars)`);
-                    response = fallback;
-                }
-            }
-
-            // If extraction returned a non-empty string that is identical to what we saw before sending,
-            // treat it as likely stale and force fallback.
-            if (platform === 'aistudio') {
-                const gotNow = String(response || '').trim();
-                if (gotNow && preSendExtract && gotNow === preSendExtract) {
-                    console.log('⚠️ Response equals pre-send extraction; forcing fallback extraction');
-                    const fallbackStale = await this.extractFallback(platform, page, prompt);
-                    const fb = String(fallbackStale || '').trim();
-                    if (fb && fb !== gotNow) {
-                        console.log('✅ Stale extraction corrected via fallback');
-                        response = fallbackStale;
+                    if (!response || responseStr.length === 0 || (platform === 'aistudio' && looksLikeThoughtsOnly)) {
+                        const fallback = await this.extractFallback(platform, page, prompt);
+                        if (fallback && fallback.trim().length > 0) {
+                            console.log(`✅ Got response via fallback (${fallback.length} chars)`);
+                            response = fallback;
+                        }
                     }
-                }
-            }
 
             // Exact-token mode: if we didn't get the expected token, try anchored fallbacks even if response is non-empty.
-            if (platform === 'aistudio' && expectedExact) {
-                const got = String(response || '').trim();
-                if (got !== expectedExact) {
-                    const fallback2 = await this.extractFallback(platform, page, prompt);
-                    const fb = String(fallback2 || '').trim();
-                    if (fb === expectedExact || fb.includes(expectedExact)) {
-                        console.log('✅ Exact-token mode: corrected reply via fallback');
-                        response = expectedExact;
-                    } else {
-                        throw new Error(`Exact-token mode failed. expected="${expectedExact}" got="${got}"`);
+                    if (platform === 'aistudio' && expectedExact) {
+                        const got = String(response || '').trim();
+                        if (got !== expectedExact) {
+                            const fallback2 = await this.extractFallback(platform, page, prompt);
+                            const fb = String(fallback2 || '').trim();
+                            if (fb === expectedExact || fb.includes(expectedExact)) {
+                                console.log('✅ Exact-token mode: corrected reply via fallback');
+                                response = expectedExact;
+                            } else {
+                                throw new Error(`Exact-token mode failed. expected="${expectedExact}" got="${got}"`);
+                            }
+                        }
                     }
-                }
-            }
 
             // If still empty, surface likely blockers rather than returning an empty string.
-            if (platform === 'aistudio' && (!response || String(response).trim().length === 0)) {
-                const hint = await page.evaluate(() => {
-                    const hay = (document.body && document.body.innerText) ? document.body.innerText : '';
-                    const known = [
-                        "Verify it's you",
-                        'Sign in',
-                        'unusual traffic',
-                        'captcha'
-                    ];
-                    for (const k of known) {
-                        if (hay.includes(k)) return k;
+                    if (platform === 'aistudio' && (!response || String(response).trim().length === 0)) {
+                        const hint = await page.evaluate(() => {
+                            const hay = (document.body && document.body.innerText) ? document.body.innerText : '';
+                            const known = [
+                                "Verify it's you",
+                                'Sign in',
+                                'unusual traffic',
+                                'captcha'
+                            ];
+                            for (const k of known) {
+                                if (hay.includes(k)) return k;
+                            }
+                            return null;
+                        });
+                        if (hint) {
+                            throw new Error(`AI Studio returned an empty reply; likely blocked by: ${hint}. Check the AI Studio tab UI.`);
+                        }
                     }
-                    return null;
-                });
-                if (hint) {
-                    throw new Error(`AI Studio returned an empty reply; likely blocked by: ${hint}. Check the AI Studio tab UI.`);
-                }
-            }
 
-                console.log(`✅ Got response (${response ? response.length : 0} chars)`);
-                return response;
-            } finally {
-                if (conn && conn.ephemeral && conn.page) {
-                    await conn.page.close({ runBeforeUnload: false }).catch(() => undefined);
-                }
+                    console.log(`✅ Got response (${response ? response.length : 0} chars)`);
+                    return response;
+                } finally {
+                    if (conn && conn.ephemeral && conn.page) {
+                        await conn.page.close({ runBeforeUnload: false }).catch(() => undefined);
+                    }
 
-                if (this.mode === 'single') {
-                    const last = this._singleEphemeralByPlatform.get(platform);
-                    if (last && conn && last === conn.page) {
-                        this._singleEphemeralByPlatform.delete(platform);
+                    if (this.mode === 'single') {
+                        // Best-effort sweep: if the close above failed, ensure we don't keep stacking tabs.
+                        await this._cleanupSingleEphemeral(platform).catch(() => undefined);
                     }
                 }
+            };
+
+            try {
+                return await runAttempt(0);
+            } catch (err) {
+                if (!opts || opts._noRetry) throw err;
+                if (!this._isRetryableUiOrCdpError(err)) throw err;
+
+                console.log(`♻️ Recoverable error detected; retrying once: ${err.message || String(err)}`);
+
+                // Reset cached state for this platform/session and force reconnect if necessary.
+                await this._resetPlatformCache(platform, sessionId).catch(() => undefined);
+                await this._forceReconnectChrome().catch(() => undefined);
+                // Small backoff to let Chrome settle.
+                await sleep(750);
+
+                return await this.send(platform, prompt, images, { ...opts, _noRetry: true });
             }
         }, lockTimeoutMs);
     }
@@ -1329,59 +1616,84 @@ class LotlController {
             return { ok: false, reason: `Unknown platform: ${platform}` };
         }
 
-        // Check Chrome debug port first
-        const version = await fetchJsonWithTimeout(
-            `http://127.0.0.1:${CHROME_DEBUG_PORT}/json/version`,
-            READY_TIMEOUT_MS
-        );
+        const attemptProbe = async () => {
+            // Check Chrome debug port first
+            const version = await fetchJsonWithTimeout(
+                `http://127.0.0.1:${CHROME_DEBUG_PORT}/json/version`,
+                READY_TIMEOUT_MS
+            );
 
-        const forceFresh = this.mode === 'single' || this.mode === 'multi';
-        const conn = await this.ensureConnection(platform, '__probe__', { fresh: forceFresh });
-        const { page } = conn;
-        await page.bringToFront();
+            const forceFresh = this.mode === 'single' || this.mode === 'multi';
+            const conn = await this.ensureConnection(platform, '__probe__', { fresh: forceFresh });
+            const { page } = conn;
+            await page.bringToFront();
+            await this.dismissInterruptions(platform, page).catch(() => undefined);
 
-        // Minimal selector probe + common blocker detection (helps production readiness)
-        const probe = await page.evaluate((selInput, urlPattern, platformName) => {
-            const urlOk = window.location.href.includes(urlPattern);
-            const isVisible = (el) => {
-                if (!el) return false;
-                const style = window.getComputedStyle(el);
-                if (!style) return false;
-                if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                const r = el.getBoundingClientRect();
-                return r && r.width > 10 && r.height > 10;
+            // Minimal probe + common blocker detection (helps production readiness)
+            const probe = await page.evaluate((selInput, urlPattern, platformName, shortcutOnly) => {
+                const urlOk = window.location.href.includes(urlPattern);
+                const hay = (document.body && document.body.innerText) ? document.body.innerText : '';
+
+                const blockers = [];
+                if (platformName === 'aistudio') {
+                    if (/Sign in/i.test(hay)) blockers.push('Sign in');
+                    if (/Verify it's you/i.test(hay)) blockers.push("Verify it's you");
+                    if (/captcha/i.test(hay) || /unusual traffic/i.test(hay)) blockers.push('Captcha/unusual traffic');
+                }
+
+                if (shortcutOnly) {
+                    return {
+                        urlOk,
+                        hasInput: true,
+                        blockers,
+                        activeUrl: window.location.href
+                    };
+                }
+
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (!style) return false;
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                    const r = el.getBoundingClientRect();
+                    return r && r.width > 10 && r.height > 10;
+                };
+
+                const nodes = Array.from(document.querySelectorAll(selInput || '')); 
+                const input = nodes.find(isVisible) || null;
+
+                return {
+                    urlOk,
+                    hasInput: Boolean(input),
+                    blockers,
+                    activeUrl: window.location.href
+                };
+            }, adapter.selectors ? adapter.selectors.input : '', adapter.urlPattern, platform, Boolean(adapter.shortcutOnly));
+
+            const result = {
+                ok: Boolean(probe.urlOk && probe.hasInput && (!probe.blockers || probe.blockers.length === 0)),
+                chrome: { webSocketDebuggerUrl: version.webSocketDebuggerUrl ? 'present' : 'missing' },
+                page: probe,
             };
 
-            const nodes = Array.from(document.querySelectorAll(selInput));
-            const input = nodes.find(isVisible) || null;
-            const hay = (document.body && document.body.innerText) ? document.body.innerText : '';
-
-            const blockers = [];
-            if (platformName === 'aistudio') {
-                if (/Sign in/i.test(hay)) blockers.push('Sign in');
-                if (/Verify it's you/i.test(hay)) blockers.push("Verify it's you");
-                if (/captcha/i.test(hay) || /unusual traffic/i.test(hay)) blockers.push('Captcha/unusual traffic');
+            if (conn && conn.ephemeral && conn.page) {
+                await conn.page.close({ runBeforeUnload: false }).catch(() => undefined);
             }
 
-            return {
-                urlOk,
-                hasInput: Boolean(input),
-                blockers,
-                activeUrl: window.location.href
-            };
-        }, adapter.selectors.input, adapter.urlPattern, platform);
-
-        const result = {
-            ok: Boolean(probe.urlOk && probe.hasInput && (!probe.blockers || probe.blockers.length === 0)),
-            chrome: { webSocketDebuggerUrl: version.webSocketDebuggerUrl ? 'present' : 'missing' },
-            page: probe,
+            return result;
         };
 
-        if (conn && conn.ephemeral && conn.page) {
-            await conn.page.close({ runBeforeUnload: false }).catch(() => undefined);
+        try {
+            return await attemptProbe();
+        } catch (err) {
+            if (!this._isRetryableUiOrCdpError(err)) {
+                throw err;
+            }
+            console.log(`♻️ Ready probe recoverable error; retrying once: ${err.message || String(err)}`);
+            await this._forceReconnectChrome().catch(() => undefined);
+            await sleep(500);
+            return await attemptProbe();
         }
-
-        return result;
     }
 }
 
@@ -1391,6 +1703,129 @@ app.use(bodyParser.json({ limit: '50mb' }));
 
 const controller = new LotlController();
 
+// ---------- API DOCUMENTATION ----------
+app.get('/docs', (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.json({
+        name: 'LotL Controller API',
+        version: 'v3-solidified',
+        description: 'REST API for sending prompts to AI platforms via browser automation. Requests are serialized per platform - only one prompt processes at a time, ensuring clean isolation.',
+        baseUrl: `http://<host>:${PORT}`,
+        mode: controller.mode,
+        
+        endpoints: {
+            '/gemini': {
+                method: 'POST',
+                description: 'Send prompt to Gemini Web (gemini.google.com)',
+                contentType: 'application/json',
+                body: {
+                    prompt: { type: 'string', required: true, description: 'The prompt text to send' },
+                    sessionId: { type: 'string', required: false, description: 'Session ID (only used in multi mode)' }
+                },
+                response: {
+                    success: { type: 'boolean', description: 'Whether the request succeeded' },
+                    reply: { type: 'string', description: 'The model response text' },
+                    platform: { type: 'string', value: 'gemini' },
+                    requestId: { type: 'string', description: 'Unique request identifier' },
+                    timestamp: { type: 'string', description: 'ISO timestamp' }
+                },
+                example: {
+                    request: { prompt: 'Explain quantum computing in simple terms' },
+                    curl: `curl -X POST http://<host>:${PORT}/gemini -H "Content-Type: application/json" -d '{"prompt":"Hello"}'`
+                }
+            },
+            '/aistudio': {
+                method: 'POST',
+                description: 'Send prompt to AI Studio (aistudio.google.com). Supports images.',
+                contentType: 'application/json',
+                body: {
+                    prompt: { type: 'string', required: true, description: 'The prompt text' },
+                    images: { type: 'array', required: false, description: 'Array of base64-encoded images' },
+                    sessionId: { type: 'string', required: false, description: 'Session ID (only used in multi mode)' }
+                },
+                response: {
+                    success: { type: 'boolean' },
+                    reply: { type: 'string' },
+                    platform: { type: 'string', value: 'aistudio' },
+                    requestId: { type: 'string' },
+                    warnings: { type: 'array' },
+                    timestamp: { type: 'string' }
+                },
+                example: {
+                    curl: `curl -X POST http://<host>:${PORT}/aistudio -H "Content-Type: application/json" -d '{"prompt":"Hello"}'`
+                }
+            },
+            '/chatgpt': {
+                method: 'POST',
+                description: 'Send prompt to ChatGPT (chatgpt.com)',
+                contentType: 'application/json',
+                body: {
+                    prompt: { type: 'string', required: true },
+                    sessionId: { type: 'string', required: false }
+                },
+                response: {
+                    success: { type: 'boolean' },
+                    reply: { type: 'string' },
+                    platform: { type: 'string', value: 'chatgpt' },
+                    requestId: { type: 'string' },
+                    timestamp: { type: 'string' }
+                },
+                example: {
+                    curl: `curl -X POST http://<host>:${PORT}/chatgpt -H "Content-Type: application/json" -d '{"prompt":"Hello"}'`
+                }
+            },
+            '/chat': {
+                method: 'POST',
+                description: 'Legacy unified endpoint. Use target param to select platform.',
+                body: {
+                    prompt: { type: 'string', required: true },
+                    target: { type: 'string', required: false, default: 'gemini', enum: ['aistudio', 'chatgpt', 'gemini'] },
+                    images: { type: 'array', required: false },
+                    sessionId: { type: 'string', required: false }
+                }
+            },
+            '/health': {
+                method: 'GET',
+                description: 'Basic health check'
+            },
+            '/ready': {
+                method: 'GET',
+                description: 'Deep readiness check (verifies browser connection)'
+            },
+            '/docs': {
+                method: 'GET',
+                description: 'This documentation'
+            }
+        },
+        
+        behavior: {
+            serialization: 'Requests are queued per platform. Only one prompt processes at a time. Concurrent requests wait in FIFO order.',
+            newChat: 'In api mode (default), each request starts a fresh chat via Ctrl+Shift+O before sending the prompt.',
+            clipboard: 'Prompts are pasted via clipboard (never typed) to avoid bot detection and support large prompts.',
+            timeout: `Lock timeout is ${Math.round(LOCK_TIMEOUT_MS_TEXT/1000)}s for text, ${Math.round(LOCK_TIMEOUT_MS_IMAGES/1000)}s for images.`
+        },
+        
+        modes: {
+            api: 'Default. Reuses one tab per platform, starts new chat each request. Best for stateless API usage.',
+            normal: 'Reuses one tab, does NOT start new chat. Continues conversation.',
+            single: 'Opens fresh tab for each request, closes after. Clean but slower.',
+            multi: 'Session-aware. Different sessionIds get separate tabs (up to MULTI_MAX_SESSIONS).'
+        },
+        
+        errors: {
+            400: 'Bad request (missing prompt)',
+            500: 'Server error (browser issue, timeout, etc.)',
+            503: 'Service unavailable (readiness check failed)'
+        },
+        
+        remoteAccess: {
+            note: 'By default, the API binds to 0.0.0.0 (all interfaces).',
+            firewall: 'Open port with: netsh advfirewall firewall add rule name="LotL API" dir=in action=allow protocol=TCP localport=' + PORT,
+            restrictLocal: 'Set HOST=127.0.0.1 to restrict to localhost only.'
+        }
+    });
+});
+
 // ---------- HEALTH CHECK ----------
 app.get('/health', (req, res) => {
     res.json({ 
@@ -1398,7 +1833,7 @@ app.get('/health', (req, res) => {
         version: 'v3-solidified',
         mode: controller.mode,
         multiMaxSessions: MULTI_MAX_SESSIONS,
-        endpoints: ['/aistudio', '/chatgpt', '/chat'],
+        endpoints: ['/aistudio', '/chatgpt', '/gemini', '/chat', '/docs'],
         timestamp: nowIso()
     });
 });
@@ -1513,6 +1948,42 @@ app.post('/chatgpt', async (req, res) => {
     }
 });
 
+// ---------- GEMINI ENDPOINT ----------
+app.post('/gemini', async (req, res) => {
+    const { prompt, sessionId } = req.body;
+    const requestId = newRequestId();
+
+    if (!prompt) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'Missing prompt',
+            endpoint: '/gemini',
+            requestId
+        });
+    }
+
+    console.log(`\n🟣 [GEMINI] Request: "${prompt.substring(0, 60)}..."`);
+
+    try {
+        const reply = await controller.send('gemini', prompt, undefined, { sessionId });
+        res.json({ 
+            success: true, 
+            reply,
+            platform: 'gemini',
+            requestId,
+            timestamp: nowIso()
+        });
+    } catch (err) {
+        console.error(`❌ [GEMINI] Error: ${err.message}`);
+        res.status(500).json({ 
+            success: false, 
+            error: err.message,
+            platform: 'gemini',
+            requestId
+        });
+    }
+});
+
 // ---------- LEGACY UNIFIED ENDPOINT ----------
 app.post('/chat', async (req, res) => {
     const { prompt, target = 'gemini', images, sessionId } = req.body;
@@ -1527,14 +1998,20 @@ app.post('/chat', async (req, res) => {
     }
     
     // Map legacy target names
+    // NOTE:
+    // - "gemini" now means Gemini Web (gemini.google.com) to match the dedicated /gemini endpoint.
+    // - Use "aistudio" or "gemini-studio" / "gemini-api" for AI Studio.
     const platformMap = {
-        'gemini': 'aistudio',
+        'gemini': 'gemini',
+        'gemini-web': 'gemini',
+        'gemini-studio': 'aistudio',
+        'gemini-api': 'aistudio',
         'aistudio': 'aistudio',
         'chatgpt': 'chatgpt',
         'gpt': 'chatgpt'
     };
     
-    const platform = platformMap[target.toLowerCase()] || 'aistudio';
+    const platform = platformMap[target.toLowerCase()] || 'gemini';
     console.log(`\n⚪ [CHAT] Request (target: ${target} -> ${platform})`);
     
     try {
@@ -1601,6 +2078,27 @@ app.get('/test/chatgpt', async (req, res) => {
     }
 });
 
+app.get('/test/gemini', async (req, res) => {
+    try {
+        const forceFresh = controller.mode === 'single' || controller.mode === 'multi';
+        const conn = await controller.ensureConnection('gemini', '__test__', { fresh: forceFresh });
+        if (conn && conn.ephemeral && conn.page) {
+            await conn.page.close({ runBeforeUnload: false }).catch(() => undefined);
+        }
+        res.json({ 
+            success: true, 
+            message: 'Gemini connection OK',
+            platform: 'gemini'
+        });
+    } catch (err) {
+        res.status(500).json({ 
+            success: false, 
+            error: err.message,
+            platform: 'gemini'
+        });
+    }
+});
+
 // ========== ERROR HANDLERS ==========
 process.on('uncaughtException', (err) => {
     console.error('💥 Uncaught Exception:', err.message);
@@ -1622,20 +2120,28 @@ const server = app.listen(PORT, HOST, () => {
     console.log(`⚙️  Mode: ${controller.mode}`);
     console.log('');
     console.log('📋 ENDPOINTS:');
-    console.log('   POST /aistudio    - AI Studio (Gemini) - DEDICATED');
-    console.log('   POST /chatgpt     - ChatGPT - DEDICATED');
+    console.log('   POST /aistudio    - AI Studio (Gemini API)');
+    console.log('   POST /gemini      - Gemini Web (gemini.google.com)');
+    console.log('   POST /chatgpt     - ChatGPT');
     console.log('   POST /chat        - Legacy unified (use target param)');
     console.log('   GET  /health      - Health check');
     console.log('   GET  /ready       - Dependency readiness probe');
-    console.log('   GET  /test/aistudio - Test AI Studio connection');
-    console.log('   GET  /test/chatgpt  - Test ChatGPT connection');
+    console.log('   GET  /docs        - API documentation (for remote clients)');
+    console.log('');
+    console.log('🔒 SERIALIZATION: One prompt at a time per platform (queued)');
+    console.log('📋 CLIPBOARD: Prompts pasted, never typed (bot-safe, large prompts OK)');
     console.log('');
     console.log('⚠️  PREREQUISITES:');
     console.log(`   1. Chrome running with --remote-debugging-port=${CHROME_DEBUG_PORT}`);
-    console.log('   2. AI Studio tab open: https://aistudio.google.com');
-    console.log('   3. ChatGPT tab open: https://chatgpt.com (optional)');
+    console.log('   2. At least one AI tab open (AI Studio, Gemini, or ChatGPT)');
     console.log('');
-    console.log(`ℹ️  Default bind is local-only (HOST=${HOST}). Set HOST=0.0.0.0 for LAN.`);
+    if (HOST === '0.0.0.0') {
+        console.log('🌍 REMOTE ACCESS ENABLED (bound to 0.0.0.0)');
+        console.log(`   Remote agents: curl -X POST http://<this-ip>:${PORT}/gemini -H "Content-Type: application/json" -d '{"prompt":"..."}'`);
+        console.log('   Firewall: netsh advfirewall firewall add rule name="LotL" dir=in action=allow protocol=TCP localport=' + PORT);
+    } else {
+        console.log(`ℹ️  Local-only (HOST=${HOST}). Set HOST=0.0.0.0 for remote access.`);
+    }
     console.log('═'.repeat(60));
 });
 

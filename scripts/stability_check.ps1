@@ -3,7 +3,7 @@ param(
   [int]$Count = 8,
   [int]$DelayMs = 0,
   [int]$TimeoutSec = 360,
-  [ValidateSet('aistudio','chatgpt','chat')][string]$Target = 'aistudio'
+  [ValidateSet('aistudio','gemini','chatgpt','chat')][string]$Target = 'aistudio'
 )
 
 $ErrorActionPreference = 'Stop'

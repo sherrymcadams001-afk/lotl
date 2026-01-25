@@ -1,295 +1,386 @@
-# LotL Controller (Local AI Studio + ChatGPT via Chrome)
+# LotL Controller v3
 
-LotL is a local HTTP controller that attaches to an existing Chrome session (via CDP) and drives:
-- **AI Studio (Gemini)**: `POST /aistudio` (text + images)
-- **ChatGPT**: `POST /chatgpt` (text-only)
+> **Living-off-the-Land AI API** — Turn your logged-in browser tabs into a local REST API for Gemini, AI Studio, and ChatGPT.
 
-It’s designed for stability: readiness probing, per-provider locking, DOM-first interaction, and image upload support for AI Studio.
+LotL attaches to an existing Chrome session (via CDP) and exposes HTTP endpoints to send prompts and receive responses. No API keys needed — it uses your logged-in browser sessions.
 
-## Prereqs
+## Features
 
-- Node.js 18+
-- Google Chrome launched with `--remote-debugging-port=9222`
-- Logged-in tabs open:
-    - https://aistudio.google.com (required)
-    - https://chatgpt.com (optional, only for `/chatgpt`)
+- **Multiple AI Platforms**: Gemini Web, AI Studio (with images), ChatGPT
+- **Request Serialization**: One prompt at a time per platform — no race conditions
+- **Bot-Safe**: Uses clipboard paste (never types) to avoid detection
+- **Large Prompts**: Clipboard-based input handles prompts of any size
+- **Remote Access**: Bind to `0.0.0.0` for access from other machines
+- **API Documentation**: Built-in `/docs` endpoint for client integration
 
-## Install
+---
+
+## Quick Start
+
+### Prerequisites
+
+- **Node.js 18+** (for native fetch)
+- **Google Chrome** launched with remote debugging
+- **Logged-in tabs** open to the AI platforms you want to use
+
+### 1. Install Dependencies
 
 ```powershell
 cd lotl-agent
 npm install
 ```
 
-## Start
-
-## Modes
-
-The controller supports three modes for clear separation of behaviors:
-
-- **normal** (default): Reuses one existing tab per platform and serializes requests per platform (safest default).
-- **single**: Treats every request as a fresh UI session by creating a new tab, navigating to the platform, executing the request, then closing the tab.
-- **multi**: Supports multiple simultaneous agent sessions inside one controller by using `sessionId` (each unique `sessionId` gets its own dedicated tab and its own lock).
-
-Set the mode via `--mode` or env `LOTL_MODE`.
-
-Optional pacing (slower, less bursty interactions):
-- `ACTION_DELAY_MS` (base delay between key UI actions)
-- `ACTION_DELAY_JITTER_MS` (adds random 0..N ms to the base delay)
-
-Examples:
+### 2. Launch Chrome with Remote Debugging
 
 ```powershell
-npm run start:local -- --mode single
-npm run start:local -- --mode multi
+# Windows
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:LOCALAPPDATA\LotL\chrome-lotl-9222"
+
+# macOS
+open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-lotl-9222
+
+# Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-lotl-9222
 ```
 
-Quick API examples (`curl.exe`):
+### 3. Open AI Tabs & Login
+
+In the launched Chrome window, open and login to:
+- https://gemini.google.com (for `/gemini`)
+- https://aistudio.google.com (for `/aistudio`)
+- https://chatgpt.com (for `/chatgpt`)
+
+### 4. Start the Controller
 
 ```powershell
-# Normal mode request (default)
-curl.exe -s -X POST "http://127.0.0.1:3000/aistudio" -H "Content-Type: application/json" -d "{\"prompt\":\"Reply with just OK\"}"
-
-# Multi mode (start controller with --mode multi). Each sessionId gets its own dedicated tab.
-curl.exe -s -X POST "http://127.0.0.1:3000/aistudio" -H "Content-Type: application/json" -d "{\"prompt\":\"Reply with just: A\",\"sessionId\":\"agent-1\"}"
-curl.exe -s -X POST "http://127.0.0.1:3000/aistudio" -H "Content-Type: application/json" -d "{\"prompt\":\"Reply with just: B\",\"sessionId\":\"agent-2\"}"
+cd lotl-agent
+node lotl-controller-v3.js
 ```
 
-In **multi** mode, run the two `agent-1` / `agent-2` calls from two terminals (or background jobs) to validate simultaneous agent sessions.
-
-Note: for large-scale multi-agent isolation across profiles, Option 1 (multiple Chrome + multiple controllers) is still the most robust.
-
-### Recommended: start an isolated instance (one command)
-
-This starts **both** Chrome (with CDP) and the controller, writes logs to files, and waits for `/ready`.
-
-Important: login is stored in Chrome’s `--user-data-dir`.
-- On the first run for a given `ChromePort`/`USER_DATA_DIR`, you may need to open the launched Chrome window and sign in to AI Studio.
-- After that, reuse the same `USER_DATA_DIR` and the controller will stay logged in (including **single** mode, since it reuses the same Chrome profile and only opens/closes tabs).
-
-Windows:
-
-```powershell
-./scripts/start-instance.ps1 -ControllerPort 3000 -ChromePort 9222 -Mode normal
+You'll see:
 ```
+════════════════════════════════════════════════════════════
+🤖 LOTL CONTROLLER v3 - SOLIDIFIED
+════════════════════════════════════════════════════════════
+🌐 Listening on http://0.0.0.0:3000
+⚙️  Mode: api
 
-To force a specific persistent profile directory:
+🔒 SERIALIZATION: One prompt at a time per platform (queued)
+📋 CLIPBOARD: Prompts pasted, never typed (bot-safe, large prompts OK)
 
-```powershell
-./scripts/start-instance.ps1 -ControllerPort 3000 -ChromePort 9222 -Mode single -UserDataDir "$env:LOCALAPPDATA\LotL\chrome-lotl-9222"
+🌍 REMOTE ACCESS ENABLED (bound to 0.0.0.0)
+════════════════════════════════════════════════════════════
 ```
-
-Or via npm:
-
-```powershell
-npm run start-instance:win -- -ControllerPort 3000 -ChromePort 9222 -Mode normal
-```
-
-If Chrome or Node aren’t on PATH, pass explicit paths:
-
-```powershell
-./scripts/start-instance.ps1 -ControllerPort 3000 -ChromePort 9222 -Mode normal -NodePath "C:\Program Files\nodejs\node.exe" -ChromePath "C:\Program Files\Google\Chrome\Application\chrome.exe"
-```
-
-macOS / Linux:
-
-```bash
-chmod +x scripts/start-instance.sh
-./scripts/start-instance.sh 3000 9222
-```
-
-To force a specific persistent profile directory:
-
-```bash
-USER_DATA_DIR="$HOME/.lotl/chrome-lotl-9222" MODE=single ./scripts/start-instance.sh 3000 9222
-```
-
-Or via npm (requires `bash`):
-
-```bash
-npm run start-instance -- 3000 9222
-```
-
-Environment overrides:
-- `USER_DATA_DIR` (Chrome profile dir)
-- `WAIT_READY_SEC` (default `180`)
-- `CHROME_PATH` (Linux, or direct binary override)
-- `MODE` (controller mode: `normal|single|multi`)
 
 ---
 
-### 1) Launch Chrome with remote debugging
+## API Reference
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/gemini` | POST | Send prompt to Gemini Web |
+| `/aistudio` | POST | Send prompt to AI Studio (supports images) |
+| `/chatgpt` | POST | Send prompt to ChatGPT |
+| `/chat` | POST | Legacy unified endpoint (use `target` param) |
+| `/health` | GET | Basic health check |
+| `/ready` | GET | Deep readiness probe |
+| `/docs` | GET | Full API documentation (JSON) |
+
+### Request Format
+
+```json
+{
+  "prompt": "Your prompt text here",
+  "sessionId": "optional-session-id",
+  "images": ["data:image/png;base64,..."]  // AI Studio only
+}
+```
+
+### Response Format
+
+```json
+{
+  "success": true,
+  "reply": "The model's response text",
+  "platform": "gemini",
+  "requestId": "req_1737817234567_abc123",
+  "timestamp": "2026-01-25T15:30:00.000Z"
+}
+```
+
+---
+
+## Usage Examples
+
+### Local Usage (PowerShell)
 
 ```powershell
-npm run launch-chrome
-```
+# Simple prompt to Gemini
+$body = @{ prompt = "Explain quantum computing in one sentence" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:3000/gemini" -Method Post -ContentType "application/json" -Body $body
 
-If Windows can’t find `node`, use:
-
-```powershell
-npm run launch-chrome:win
-```
-
-macOS (alternative to `npm run launch-chrome`):
-
-```bash
-open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-lotl-9222
-```
-
-### 2) Start the controller
-
-Local-only bind (recommended):
-
-```powershell
-npm run start:local
-```
-
-If Windows can’t find `node` (common in locked-down shells), use:
-
-```powershell
-npm run start:local:win
-```
-
-LAN bind (only if you need it):
-
-```powershell
-npm run start:lan
-```
-
-Windows fallback:
-
-```powershell
-npm run start:lan:win
-```
-
-## Multiple agent systems (Option 1: multiple Chrome + multiple controllers)
-
-Run one Chrome profile + controller per agent system. Each system must have a unique Chrome debug port and controller HTTP port.
-
-Example: two AI Studio agent systems on the same machine:
-
-Recommended (Windows):
-
-```powershell
-./scripts/start-instance.ps1 -ControllerPort 3000 -ChromePort 9222 -UserDataDir C:\temp\chrome-lotl-9222
-./scripts/start-instance.ps1 -ControllerPort 3001 -ChromePort 9223 -UserDataDir C:\temp\chrome-lotl-9223
-```
-
-```powershell
-# Agent system A
-npm run launch-chrome:win -- --chrome-port 9222 --user-data-dir C:\temp\chrome-lotl-9222
-npm run start:local:win -- --port 3000 --chrome-port 9222
-
-# Agent system B
-npm run launch-chrome:win -- --chrome-port 9223 --user-data-dir C:\temp\chrome-lotl-9223
-npm run start:local:win -- --port 3001 --chrome-port 9223
-```
-
-macOS equivalent:
-
-Recommended (macOS/Linux):
-
-```bash
-USER_DATA_DIR=/tmp/chrome-lotl-9222 ./scripts/start-instance.sh 3000 9222
-USER_DATA_DIR=/tmp/chrome-lotl-9223 ./scripts/start-instance.sh 3001 9223
-```
-
-```bash
-# Agent system A
-node scripts/launch-chrome.js --chrome-port 9222 --user-data-dir /tmp/chrome-lotl-9222
-npm run start:local -- --port 3000 --chrome-port 9222
-
-# Agent system B
-node scripts/launch-chrome.js --chrome-port 9223 --user-data-dir /tmp/chrome-lotl-9223
-npm run start:local -- --port 3001 --chrome-port 9223
-```
-
-## Verify
-
-```powershell
-curl http://127.0.0.1:3000/health
-curl http://127.0.0.1:3000/ready
-```
-
-`/ready` should return `ok: true` and show an AI Studio URL + `hasInput: true`.
-
-If `/ready` returns `ok:false` with `blockers`, the AI Studio tab is likely in a blocked UI state (login, verification, captcha/unusual traffic). Fix the AI Studio tab until `/ready` is healthy.
-
-## Stability check (production)
-
-Run a small sequential probe (fails fast if `/ready` is unhealthy):
-
-```powershell
-./scripts/stability_check.ps1 -ControllerUrl http://127.0.0.1:3000 -Count 8 -TimeoutSec 180 -Target aistudio
-```
-
-## Production notes
-
-- Prefer starting the controller detached (so it survives shell disconnect) and writing logs to files (for example `controller_3000.out.log` / `controller_3000.err.log`).
-- Use `/health` for liveness and `/ready` for real usability checks.
-- For multiple agent systems, use Option 1 (multiple Chrome debug ports + multiple controller ports) to isolate sessions.
-
-## Use
-
-### AI Studio (text)
-
-```powershell
-$body = @{ prompt = "Reply with just OK" } | ConvertTo-Json
-Invoke-RestMethod -Uri "http://127.0.0.1:3000/aistudio" -Method Post -ContentType "application/json" -Body $body -TimeoutSec 90
-```
-
-### AI Studio (image)
-
-Send base64 *data URLs*:
-
-```powershell
-$img = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
-$body = @{ prompt = "What color is this image? Reply with just the color."; images = @($img) } | ConvertTo-Json -Depth 3
+# AI Studio with image
+$img = [Convert]::ToBase64String([IO.File]::ReadAllBytes("photo.png"))
+$body = @{ prompt = "Describe this image"; images = @("data:image/png;base64,$img") } | ConvertTo-Json -Depth 3
 Invoke-RestMethod -Uri "http://127.0.0.1:3000/aistudio" -Method Post -ContentType "application/json" -Body $body -TimeoutSec 120
+
+# ChatGPT
+$body = @{ prompt = "Write a haiku about coding" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:3000/chatgpt" -Method Post -ContentType "application/json" -Body $body
 ```
 
-### ChatGPT (text-only)
+### Local Usage (curl)
+
+```bash
+# Gemini
+curl -X POST http://127.0.0.1:3000/gemini \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Hello, how are you?"}'
+
+# AI Studio
+curl -X POST http://127.0.0.1:3000/aistudio \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Explain machine learning"}'
+
+# ChatGPT
+curl -X POST http://127.0.0.1:3000/chatgpt \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Tell me a joke"}'
+```
+
+### Local Usage (Python)
+
+```python
+import requests
+
+# Send prompt to Gemini
+response = requests.post(
+    "http://127.0.0.1:3000/gemini",
+    json={"prompt": "What is the capital of France?"},
+    timeout=120
+)
+data = response.json()
+print(data["reply"])
+```
+
+### Local Usage (Node.js)
+
+```javascript
+const response = await fetch("http://127.0.0.1:3000/gemini", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ prompt: "Hello!" })
+});
+const data = await response.json();
+console.log(data.reply);
+```
+
+---
+
+## Remote Access
+
+The controller binds to `0.0.0.0` by default, allowing remote agents to connect.
+
+### Enable Firewall (Windows)
 
 ```powershell
-$body = @{ prompt = "Say hello" } | ConvertTo-Json
-Invoke-RestMethod -Uri "http://127.0.0.1:3000/chatgpt" -Method Post -ContentType "application/json" -Body $body -TimeoutSec 90
+# Run as Administrator
+netsh advfirewall firewall add rule name="LotL Controller" dir=in action=allow protocol=TCP localport=3000
 ```
 
-### Legacy endpoint (backward-compatible)
+### Remote Agent Usage
+
+From any machine on the network:
+
+```bash
+curl -X POST http://192.168.1.100:3000/gemini \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Hello from remote agent"}'
+```
+
+### Restrict to Local Only
 
 ```powershell
-$body = @{ target = "gemini"; prompt = "Hello" } | ConvertTo-Json
-Invoke-RestMethod -Uri "http://127.0.0.1:3000/chat" -Method Post -ContentType "application/json" -Body $body -TimeoutSec 90
+$env:HOST = "127.0.0.1"
+node lotl-controller-v3.js
 ```
+
+---
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `3000` | HTTP server port |
+| `HOST` | `0.0.0.0` | Bind address (`127.0.0.1` for local-only) |
+| `CHROME_PORT` | `9222` | Chrome DevTools Protocol port |
+| `LOTL_MODE` | `api` | Operation mode (see below) |
+| `ACTION_DELAY_MS` | `0` | Base delay between actions (ms) |
+| `ACTION_DELAY_JITTER_MS` | `0` | Random jitter added to delay |
+| `LOCK_TIMEOUT_MS_TEXT` | `420000` | Timeout for text requests (7 min) |
+| `LOCK_TIMEOUT_MS_IMAGES` | `900000` | Timeout for image requests (15 min) |
+
+### Operation Modes
+
+| Mode | Description |
+|------|-------------|
+| `api` | **(Default)** Reuses one tab per platform. Starts fresh chat each request via `Ctrl+Shift+O`. Best for stateless API usage. |
+| `normal` | Reuses one tab, does NOT start new chat. Continues the conversation. |
+| `single` | Opens fresh tab for each request, closes after. Slowest but cleanest isolation. |
+| `multi` | Session-aware. Different `sessionId` values get separate tabs (up to `MULTI_MAX_SESSIONS`). |
+
+### Example: Custom Configuration
+
+```powershell
+$env:PORT = "3001"
+$env:CHROME_PORT = "9230"
+$env:LOTL_MODE = "single"
+$env:ACTION_DELAY_MS = "200"
+node lotl-controller-v3.js
+```
+
+---
+
+## Multiple Instances
+
+Run separate Chrome profiles + controllers for complete isolation:
+
+### Instance A (Port 3000, Chrome 9222)
+
+```powershell
+# Terminal 1: Chrome
+& chrome.exe --remote-debugging-port=9222 --user-data-dir="$env:LOCALAPPDATA\LotL\chrome-9222"
+
+# Terminal 2: Controller
+$env:PORT = "3000"; $env:CHROME_PORT = "9222"
+node lotl-controller-v3.js
+```
+
+### Instance B (Port 3001, Chrome 9223)
+
+```powershell
+# Terminal 3: Chrome
+& chrome.exe --remote-debugging-port=9223 --user-data-dir="$env:LOCALAPPDATA\LotL\chrome-9223"
+
+# Terminal 4: Controller
+$env:PORT = "3001"; $env:CHROME_PORT = "9223"
+node lotl-controller-v3.js
+```
+
+---
+
+## Health Checks
+
+### Basic Health
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:3000/health
+```
+
+### Deep Readiness
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:3000/ready
+```
+
+Returns `ok: true` when browser is connected and AI tabs are accessible.
+
+### Stability Test
+
+```powershell
+./scripts/stability_check.ps1 -ControllerUrl http://127.0.0.1:3000 -Count 5 -Target gemini
+```
+
+---
 
 ## Troubleshooting
 
-- `/ready` is `503` / `ok:false`
-    - Ensure Chrome is launched with `--remote-debugging-port=9222` and AI Studio is open + logged in.
-- Requests hang or time out
-    - Bring the AI Studio tab to the foreground and ensure it’s not showing a security prompt.
-- `npm run start:*` says `node` not found
-    - Scripts auto-extend `PATH`, but if you’re in a custom environment, use the full path: `C:\Program Files\nodejs\node.exe lotl-controller-v3.js`.
+### "Cannot connect to Chrome"
+
+- Ensure Chrome is running with `--remote-debugging-port=9222`
+- Verify: `curl http://127.0.0.1:9222/json/version`
+
+### "Failed to set input" / "Clipboard paste failed"
+
+- RDP users: Enable clipboard sharing in your RDP client
+- Check the AI tab is visible and not showing a modal/popup
+
+### "/ready returns ok: false"
+
+- Open Chrome and check the AI Studio tab
+- Look for login prompts, captchas, or "unusual traffic" warnings
+- Fix the tab state, then retry
+
+### Requests hang or timeout
+
+- Bring the AI tab to foreground
+- Check for security prompts or rate limiting
+- Increase `LOCK_TIMEOUT_MS_TEXT` if needed
+
+### "Port already in use"
+
+```powershell
+# Find and kill the process
+Get-NetTCPConnection -LocalPort 3000 | Select-Object OwningProcess | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+```
+
+---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    LotL Controller                        │
-│  ┌────────────────┐  ┌────────────────┐  ┌────────────┐  │
-│  │ Express Server │  │ Puppeteer Core │  │  Adapters  │  │
-│  │   (Port 3000)  │──│   (CDP/WSS)    │──│ Gemini/GPT │  │
-│  └────────────────┘  └────────────────┘  └────────────┘  │
-└──────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────┐
-│           Chrome Browser (Port 9222)                      │
-│  ┌─────────────────┐  ┌─────────────────┐                │
-│  │ Gemini Tab      │  │ ChatGPT Tab     │                │
-│  └─────────────────┘  └─────────────────┘                │
-└──────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                      LotL Controller v3                         │
+│  ┌──────────────┐  ┌────────────────┐  ┌────────────────────┐  │
+│  │ Express API  │  │ Puppeteer-Core │  │     Adapters       │  │
+│  │  /gemini     │──│  (CDP/WSS)     │──│ • Gemini (paste)   │  │
+│  │  /aistudio   │  │                │  │ • AI Studio (DOM)  │  │
+│  │  /chatgpt    │  │                │  │ • ChatGPT (DOM)    │  │
+│  └──────────────┘  └────────────────┘  └────────────────────┘  │
+│                              │                                  │
+│  🔒 Request Serialization    │  📋 Clipboard-based input       │
+│  (one prompt per platform)   │  (bot-safe, large prompts OK)   │
+└─────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Chrome Browser (--remote-debugging-port)           │
+│  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐   │
+│  │  gemini.google  │ │  aistudio.google│ │   chatgpt.com   │   │
+│  │    .com         │ │     .com        │ │                 │   │
+│  │  (logged in)    │ │  (logged in)    │ │  (logged in)    │   │
+│  └─────────────────┘ └─────────────────┘ └─────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Key Behaviors
+
+### Request Serialization
+Requests are queued per platform. If you send 3 prompts to `/gemini` simultaneously, they execute one at a time (FIFO). Each gets a fresh chat and its own response.
+
+### New Chat Per Request (API Mode)
+In the default `api` mode, each request:
+1. Presses `Ctrl+Shift+O` to start a new chat
+2. Pastes the prompt via clipboard
+3. Clicks send
+4. Waits for response
+5. Returns the response
+
+This ensures stateless, API-like behavior.
+
+### Clipboard Paste (Never Types)
+Prompts are pasted via the system clipboard, not typed character-by-character. This:
+- Avoids bot detection from rapid typing
+- Handles large prompts (10KB+) efficiently
+- Works reliably across platforms
+
+---
 
 ## License
 
